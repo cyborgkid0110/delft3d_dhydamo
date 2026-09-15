@@ -64,6 +64,27 @@ it. The existing JSON is the primary content source; the YAML is its executable 
 
 ## 3. Scope
 
+### 3.0 Deliverables & the genericity contract
+This spec covers two separable deliverables, with a strict dependency:
+
+- **Deliverable A — the generic adapter (PRIMARY SCOPE).** The rule-file grammar
+  (§6–§9) and the execution engine (§5, §10–§11). This is **source-dataset-agnostic**:
+  it converts *any* raw dataset that can be expressed as vector / table / raster layers
+  with attribute columns into the HyDAMO / `template` target. The **target format is
+  fixed as HyDAMO** by design — "any type of dataset" refers to the *raw input*, not the
+  output.
+- **Deliverable B — the Houston `houston_centre` rule file.** A concrete YAML instance
+  (§12, §14). It **depends on A** and doubles as A's end-to-end acceptance test. It can
+  be deferred or dropped without affecting A; it adds **no engine code**.
+
+**Genericity contract (the invariant that guarantees (1)):** *no source-specific
+identifier — file name, layer name, column name, filter value, magic constant — ever
+appears in engine code.* Every such identifier lives only in a rule file. The Houston
+material in §12/§14 is rule-file **data**, not part of the engine. New **source formats**
+are added behind a `driver:` (§6.3) in `io_sources.py`; new **target primitives** are
+added as engine ops — neither requires a rule to embed code. If a future task needs a
+non-HyDAMO target, that is a new adapter target, out of this spec's scope.
+
 ### In scope
 - A rule-file grammar (YAML) covering vector, raster, and table outputs.
 - A generic execution engine (Python, `hydrolib_env`) that reads the rule file and
@@ -200,6 +221,28 @@ lookups:
   material_roughness: { EAR: 0.030, CP: 0.013, _default: 0.025 }
   mainshape_xs:       { RND: circle, BOX: rectangle, ARCH: rectangle, _default: circle }
 ```
+
+### 6.3 Source declaration & drivers
+A source block (`source:` singular, or an entry of `sources:`) points at raw data. To
+keep Deliverable A generic across *any* raw dataset, the reader is selected by an
+optional `driver:`; when omitted it is inferred from the extension. Drivers are the only
+place a new raw format is added, and they live in `io_sources.py` (code) — never in a
+rule as code.
+
+| Key | Meaning |
+|-----|---------|
+| `use:` | a `sources:` alias (§6, DRY) — expands to its `file:` |
+| `file:` | path (relative to `source_root`) to a container (gpkg/shp/csv/…) |
+| `layer:` | layer name within a multi-layer container (gpkg) |
+| `glob:` | a glob (e.g. `dem/USGS_1M_*.tif`) → many files (raster mosaics) |
+| `driver:` | reader id: `pyogrio` (vector), `csv`, `raster`, `vrt`, … (default: infer) |
+| `crs:` | override source CRS when the file lacks one |
+| `filter:` | row filter expression (§9) applied at read time |
+| `id:` | handle used by `combine.on` / `sjoin` to refer to this source |
+
+Built-in drivers ship with A; adding, say, `postgis` or `netcdf` is a new `io_sources.py`
+entry plus a `driver:` value — no engine or rule-grammar change. This is what makes
+"convert **any** raw dataset" a code-extensibility point rather than a rewrite.
 
 ---
 
