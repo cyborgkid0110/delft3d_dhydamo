@@ -56,11 +56,18 @@ new dataset's `source.yaml` only means listing what exists.
 
 ### Key inventory and requirement tier
 
-**Tier 1 — always required** (missing/unresolvable → error, notebook aborts):
+**Tier 1 — always required** (missing/unresolvable → error, notebook aborts).
+For the crosssection CSVs, "required" means the key must resolve to an
+existing file — it may be a header-only/empty CSV if a dataset pack doesn't
+use that shape type; the for-loops that build definitions from each CSV
+already no-op on zero rows.
 
 - `hydroobject`
 - `storagenodes_shp` or `storageareas_shp` (at least one of the two)
 - `storagenodes_data`
+- `boundary_conditions`
+- `crosssection_circle`, `crosssection_rectangle`, `crosssection_trapezium`,
+  `crosssection_yz`, `crosssection_zw`, `crosssection_location`
 - `raster_dem` (only enforced when `build["twod"]` is `true`)
 - `extent_2d` (only enforced when `build["twod"]` is `true`)
 
@@ -76,11 +83,8 @@ the flag is `true` but the source is missing):
 **Tier 3 — optional** (missing → `warnings.warn(...)`, `sources[key] = None`,
 corresponding notebook block skipped): `weirs`, `bridges`, `orifices`,
 `opening`, `management_device`, `pumpstations`, `pumps`, `management`,
-`boundary_conditions`, `observation_points`, every individual crosssection
-CSV (`crosssection_circle`, `crosssection_rectangle`, `crosssection_trapezium`,
-`crosssection_yz`, `crosssection_zw`, `crosssection_location`),
-`profile_roughness`, `profile_line`, `profile_group`, `raster_landuse`,
-`trachytopes_ttd`, `trachytopes_fractions`, `raster_soil`,
+`observation_points`, `profile_roughness`, `profile_line`, `profile_group`,
+`raster_landuse`, `trachytopes_ttd`, `trachytopes_fractions`, `raster_soil`,
 `infiltration_capacity` (the last four only "always optional" when their
 owning flag is `false`; see Tier 2 when the flag is `true`).
 
@@ -186,10 +190,13 @@ lines.
   `data_path / "..."` to `sources["<key>"]`, wrapped in
   `if sources["<key>"] is not None:` for every Tier 3 key (weirs, bridges,
   orifices, opening, management_device, pumpstations, pumps, management,
-  boundary_conditions, observation_points, each crosssection CSV,
-  profile_roughness, profile_line, profile_group) — mirroring the existing
-  `if TwoD:` / `if RR:` pattern already used in the notebook. Storage falls
-  back between `storagenodes_shp` and `storageareas_shp`.
+  observation_points, profile_roughness, profile_line, profile_group) —
+  mirroring the existing `if TwoD:` / `if RR:` pattern already used in the
+  notebook. Storage falls back between `storagenodes_shp` and
+  `storageareas_shp`. The crosssection cell and the boundary_conditions cell
+  read `sources["<key>"]` unconditionally (no presence guard) since both are
+  now Tier 1 — a missing key already aborted the notebook at the loading
+  cell.
 - The trachytopes cell and infiltration cell gain `if build["landuse"]:` /
   `if build["infiltration"]:` guards.
 - All snap-distance, init-depth, prefix, and `crs_epsg` literals identified
@@ -205,7 +212,10 @@ hand-authored `source.yaml` files:
 - `template/datasets/source.yaml`: every optional key present — exercises
   the "everything loads, no warnings" path.
 - `houston/houston_centre/output_2_cleaned/source.yaml`: a genuinely partial
-  pack — exercises Tier 1 checks passing, several Tier 3 warnings firing
-  (orifices, yz/zw crosssections, observation points, trachytopes,
+  pack — exercises Tier 1 checks passing (this pack has no `yz_definition.csv`
+  / `zw_definition.csv`, so empty placeholder CSVs with just the header row
+  are added under the dataset folder and pointed to by
+  `crosssection_yz`/`crosssection_zw` to satisfy the Tier 1 requirement),
+  several Tier 3 warnings firing (orifices, observation points, trachytopes,
   infiltration all absent), and confirms the notebook still completes a full
   model build without those optional pieces.
