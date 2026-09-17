@@ -19,9 +19,15 @@ Two config files fix this:
   the actual file/layer for that pack, so the notebook never hardcodes a
   path. Missing optional data becomes a warning + skipped step; missing
   required data becomes a hard error.
-- **`build.json`** (one shared file, e.g. `template/build.json`): holds every
-  model-build *parameter* (never a path, except the one deliberate
-  `dimr_path` exception) currently hardcoded in notebook cells.
+- **`build.json`** (one per dataset folder, alongside that dataset's
+  `source.yaml`): holds every model-build *parameter* (never a path, except
+  the one deliberate `dimr_path` exception) currently hardcoded in notebook
+  cells. It is per-dataset rather than shared because flags like `landuse`/
+  `infiltration` are only true for packs that actually carry that data (e.g.
+  `template/datasets` has landuse/soil rasters and trachytopes/infiltration
+  files; `houston/houston_centre/output_2_cleaned` has neither, so its
+  build.json sets both flags `false`). The notebook loads both files from a
+  single `dataset_path`.
 
 ## `source.yaml` schema
 
@@ -83,7 +89,10 @@ the flag is `true` but the source is missing):
 **Tier 3 — optional** (missing → `warnings.warn(...)`, `sources[key] = None`,
 corresponding notebook block skipped): `weirs`, `bridges`, `orifices`,
 `opening`, `management_device`, `pumpstations`, `pumps`, `management`,
-`observation_points`, `profile_roughness`, `profile_line`, `profile_group`,
+`observation_points`, `profile` (the `ProfielPunt` GIS points layer used for
+the z-from-hoogte fix and GIS-based crosssection conversion — distinct from
+the CSV-based `crosssection_*` shape definitions, which is why it's optional
+while they're Tier 1), `profile_roughness`, `profile_line`, `profile_group`,
 `raster_landuse`, `trachytopes_ttd`, `trachytopes_fractions`, `raster_soil`,
 `infiltration_capacity` (the last four only "always optional" when their
 owning flag is `false`; see Tier 2 when the flag is `true`).
@@ -148,33 +157,36 @@ Early cell, replacing today's `data_path` cell:
 
 ```python
 dataset_path = Path("../houston/houston_centre/output_2_cleaned").resolve()
-sources = load_sources(dataset_path / "source.yaml")   # dict[str, Path | None]
-build = load_build_config(Path("../template/build.json"))  # dict[str, Any]
+build = load_build_config(dataset_path / "build.json")        # dict[str, Any]
+sources, layers = load_sources(dataset_path / "source.yaml", build)
+# sources: dict[str, Path | None]  -- resolved file path for every key
+# layers:  dict[str, str | None]   -- GPKG layer name for keys that have one, else None
 ```
 
-`load_sources(path)`:
-1. Parse the yaml.
-2. For each Tier 1 key: resolve the path (and GPKG layer, if applicable)
-   relative to `path.parent`. Missing key in the yaml, missing file, or
-   missing GPKG layer → raise (`FileNotFoundError` for a missing file,
-   `ValueError` naming the key and layer for a missing GPKG layer). `raster_dem`
-   and `extent_2d` are only enforced when `build["twod"]` is `true`, so this
-   check happens after `build` is loaded (see step 4).
+`build` is loaded first because Tier 1/Tier 2 enforcement for `raster_dem`/
+`extent_2d`/`landuse`/`infiltration` depends on its flags.
+
+`load_sources(path, build)`:
+1. Parse the yaml. Each entry becomes `sources[key]` (the resolved path) and
+   `layers[key]` (the `layer:` value if present, else `None`).
+2. For each Tier 1 key: resolve the path relative to `path.parent`. Missing
+   key in the yaml, missing file, or (for a GPKG entry) missing layer → raise
+   (`FileNotFoundError` for a missing file, `ValueError` naming the key and
+   layer for a missing GPKG layer). `raster_dem` and `extent_2d` are only
+   enforced when `build["twod"]` is `true`.
 3. For each Tier 3 key: resolve if present; on any failure,
    `warnings.warn(f"optional source '{key}' not found, skipping", stacklevel=2)`
-   and set `sources[key] = None`.
-4. After `build` is loaded, run the Tier 2 cross-check: if
-   `build["landuse"]` is `true`, require `raster_landuse` and
-   `trachytopes_ttd` to have resolved (error naming the flag and the missing
-   key if not); same for `build["infiltration"]` against `raster_soil` and
-   `infiltration_capacity`. Also enforce the deferred `raster_dem`/`extent_2d`
-   check from step 2 here.
-5. Return the `sources` dict.
+   and set `sources[key] = None` (`layers[key]` stays `None` too).
+4. Run the Tier 2 cross-check: if `build["landuse"]` is `true`, require
+   `raster_landuse` and `trachytopes_ttd` to have resolved (error naming the
+   flag and the missing key if not); same for `build["infiltration"]`
+   against `raster_soil` and `infiltration_capacity`.
+5. Return `(sources, layers)`.
 
 `load_build_config(path)` is a plain `json.load`; malformed JSON raises
 naturally. All build.json keys are effectively required — it's a single
-hand-maintained file, not a variable per-dataset artifact, so no additional
-validation is layered on top.
+hand-maintained file per dataset, not something with its own optional
+sub-fields, so no additional validation is layered on top.
 
 Errors abort the notebook at the loading cell, before any HyDAMO/mesh work
 starts (fail fast, not halfway through a mesh build). Warnings use
@@ -187,16 +199,17 @@ lines.
   `TwoD`/`RR`/`RTC` booleans are replaced by `build["twod"]`/`build["rr"]`/
   `build["rtc"]` everywhere they're referenced.
 - Every cell reading a specific dataset file switches from
-  `data_path / "..."` to `sources["<key>"]`, wrapped in
+  `data_path / "..."` to `sources["<key>"]` (passing `layers["<key>"]` as the
+  `layer_name=` argument for GPKG reads), wrapped in
   `if sources["<key>"] is not None:` for every Tier 3 key (weirs, bridges,
   orifices, opening, management_device, pumpstations, pumps, management,
-  observation_points, profile_roughness, profile_line, profile_group) —
-  mirroring the existing `if TwoD:` / `if RR:` pattern already used in the
-  notebook. Storage falls back between `storagenodes_shp` and
-  `storageareas_shp`. The crosssection cell and the boundary_conditions cell
-  read `sources["<key>"]` unconditionally (no presence guard) since both are
-  now Tier 1 — a missing key already aborted the notebook at the loading
-  cell.
+  observation_points, profile, profile_roughness, profile_line,
+  profile_group) — mirroring the existing `if TwoD:` / `if RR:` pattern
+  already used in the notebook. Storage falls back between
+  `storagenodes_shp` and `storageareas_shp`. The crosssection cell and the
+  boundary_conditions cell read `sources["<key>"]` unconditionally (no
+  presence guard) since both are now Tier 1 — a missing key already aborted
+  the notebook at the loading cell.
 - The trachytopes cell and infiltration cell gain `if build["landuse"]:` /
   `if build["infiltration"]:` guards.
 - All snap-distance, init-depth, prefix, and `crs_epsg` literals identified
@@ -207,15 +220,20 @@ lines.
 
 No separate unit-test suite — the loader is inline notebook code, not an
 importable module. Acceptance is running the notebook end-to-end against two
-hand-authored `source.yaml` files:
+hand-authored dataset packs, each with its own `source.yaml` + `build.json`:
 
-- `template/datasets/source.yaml`: every optional key present — exercises
-  the "everything loads, no warnings" path.
-- `houston/houston_centre/output_2_cleaned/source.yaml`: a genuinely partial
-  pack — exercises Tier 1 checks passing (this pack has no `yz_definition.csv`
-  / `zw_definition.csv`, so empty placeholder CSVs with just the header row
+- `template/datasets/`: every optional key present, `landuse: true` and
+  `infiltration: true` in its build.json — exercises the "everything loads,
+  no warnings" path plus the Tier 2 conditional-requirement checks actually
+  passing.
+- `houston/houston_centre/output_2_cleaned/`: a genuinely partial pack,
+  `landuse: false` and `infiltration: false` in its build.json (it has
+  neither the rasters nor the trachytopes/infiltration files) — exercises
+  Tier 1 checks passing (this pack has no `yz_definition.csv` /
+  `zw_definition.csv`, so empty placeholder CSVs with just the header row
   are added under the dataset folder and pointed to by
   `crosssection_yz`/`crosssection_zw` to satisfy the Tier 1 requirement),
-  several Tier 3 warnings firing (orifices, observation points, trachytopes,
-  infiltration all absent), and confirms the notebook still completes a full
-  model build without those optional pieces.
+  several Tier 3 warnings firing (orifices, observation points, `profile`
+  family absent), and confirms the notebook still completes a full model
+  build without those optional pieces and without ever touching
+  landuse/infiltration data.
