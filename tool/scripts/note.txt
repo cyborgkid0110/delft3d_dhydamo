@@ -1,0 +1,11 @@
+Run in order, from repo root:
+
+conda run -n hydrolib_env python tool/scripts/clean_network.py houston/houston_centre/output_2 --keep houston/houston_centre/river_boundary.shp
+conda run -n hydrolib_env python tool/scripts/clean_storagenodes.py houston/houston_centre/output_2_cleaned --overwrite
+conda run -n hydrolib_env python tool/scripts/connect_outfalls.py houston/houston_centre/output_2_cleaned --overwrite
+conda run -n hydrolib_env python tool/scripts/divide_subregions.py houston/houston_centre/output_2_cleaned
+conda run -n hydrolib_env python tool/scripts/split_submodels.py --dataset houston/houston_centre/output_2_cleaned
+
+Build the QGIS project of all submodels + links (run with the QGIS python, not conda;
+in PowerShell prefix a quoted path with the call operator &):
+& "G:\QGIS\QGIS 3.44.8\bin\python-qgis-ltr.bat" tool/scripts/build_qgis_project.py
