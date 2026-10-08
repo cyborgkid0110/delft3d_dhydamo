@@ -344,16 +344,36 @@ def build_submodel(submodel_dir, build, source_entries, shared_dem):
         )
 
     for _, r in trapezium_defs.iterrows():
-        hydamo.crosssections.add_trapezium_definition(
-            slope=float(r["slope"]),
-            maximumflowwidth=float(r["maximumflowwidth"]),
-            bottomwidth=float(r["bottomwidth"]),
-            closed=int(r["closed"]),
-            bottomlevel=float(r["bottomlevel"]),
-            roughnesstype=r["roughnesstype"],
-            roughnessvalue=float(r["roughnessvalue"]),
-            name=r["name"],
-        )
+        # replicate `hydamo.crosssections.add_trapezium_definition` with custom build
+        roughnessname = hydamo.crosssections.get_roughnessname(r["roughnesstype"], r["roughnessvalue"])
+    
+        if r["bottomlevel"] is None:
+            r["bottomlevel"] = 0.0
+        if r["maximumflowlevel"] is None:
+            r["maximumflowlevel"] = r["bottomlevel"] + 2
+        if r["name"] is None:
+            r["name"] = f"trapz_s{r["slope"]:.1f}_bw{r["bottomwidth"]:.1f}_mw{r["maximumflowwidth"]:.1f}_bl{r["bottomlevel"]:.1f}_ml{r["maximumflowlevel"]:.1f}"
+
+        if r["maximumflowlevel"] < r["bottomlevel"]:
+            raise ValueError(f"{r["name"]} has `maximumflowlevel` is smaller than `bottomlevel`")
+
+        levels = f"{r["bottomlevel"]} {r["maximumflowlevel"]}"
+        if not r["closed"]:
+            flowwidths = (
+                f"{r["bottomwidth"]:.2f} {r["bottomwidth"] + 2.*((r["maximumflowlevel"]-r["bottomlevel"])*r["slope"]):.2f}"
+            )
+        else:
+            flowwidths = f"{r["bottomwidth"]:.2f} {r["maximumflowwidth"]:.2f}"
+        hydamo.crosssections.crosssection_def[r["name"]] = {
+            "id":r["name"],
+            "type": "zw",
+            "thalweg": 0.0,
+            "numlevels": 2,
+            "levels": levels,
+            "flowwidths": flowwidths,
+            "totalwidths": flowwidths,
+            "frictionid": roughnessname,
+        }
 
     for name, grp in yz_defs.groupby("name", sort=False):
         grp = grp.sort_values("order")
@@ -385,12 +405,17 @@ def build_submodel(submodel_dir, build, source_entries, shared_dem):
     # handled elsewhere); only assign locations for branches that actually exist.
     crosssection_map = crosssection_map[crosssection_map["branchid"].isin(hydamo.branches.index)].copy()
 
+    # optional `shift` column (set by set_pipe_inverts.py) lowers a pipe's
+    # invert to the storage floor; absent/NaN -> 0.0 (hydrolib default).
+    _has_shift = "shift" in crosssection_map.columns
     for _, r in crosssection_map.iterrows():
         L = hydamo.branches.at[r["branchid"], "geometry"].length
+        _shift = float(r["shift"]) if _has_shift and pd.notna(r.get("shift")) else 0.0
         hydamo.crosssections.add_crosssection_location(
             branchid=r["branchid"],
             chainage=float(r["chainage_fraction"]) * L,
             definition=r["definition"],
+            shift=_shift,
         )
 
     # 1 pump station can incldue many pumps

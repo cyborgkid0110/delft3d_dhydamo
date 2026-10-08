@@ -1,0 +1,32 @@
+Houston preprocessing (run from repo root, in order)
+====================================================
+
+1. Crop raw/ to one watershed -> houston/houston_<name>/ (6 gpkgs + region.shp)
+   conda run -n hydrolib_env python houston/crop_to_watershed.py --list
+   conda run -n hydrolib_env python houston/crop_to_watershed.py "WHITE OAK BAYOU"
+
+2. Fill NULL/empty open_drains LINETYPE with "Offroad Channel - Manmade"
+   (run BEFORE step 3 so the filled features land in open_drains_offroad)
+   conda run -n hydrolib_env python houston/fill_open_drains_linetype.py houston/houston_white_oak_bayou --overwrite
+
+3. Mark features into separate layers of Stormdrain.gpkg (re-run = layers rewritten)
+   conda run -n hydrolib_env python houston/mark_stormdrain_features.py houston/houston_white_oak_bayou
+
+4. Remove roadside discharge points and roadside/railroad ditch, rain garden, swale open_drains
+   (run AFTER step 3, it deletes the Railroad Ditch features step 3 marks)
+   conda run -n hydrolib_env python houston/remove_stormdrain_features.py houston/houston_white_oak_bayou --overwrite
+
+5. Remove gravity_mains_crossings with an endpoint on a manhole / inlet / fitting
+   (--tol 0 = exact match; --tol 0.001 also catches float noise)
+   conda run -n hydrolib_env python houston/remove_by_endpoint.py houston/houston_white_oak_bayou --overwrite
+
+Optional: remove source-layer features that match a mask layer
+   (--match id|equals|intersects|within, default id on OBJECTID)
+   conda run -n hydrolib_env python houston/remove_by_mask.py houston/houston_white_oak_bayou gravity_mains gravity_mains_crossings --overwrite
+   conda run -n hydrolib_env python houston/remove_by_mask.py houston/houston_white_oak_bayou open_drains open_drains_roadside --overwrite
+
+Notes
+- Fill / remove scripts (2, 4, 5, mask): without --overwrite they copy the folder to <dir>_cleaned;
+  --dry-run only prints counts.
+- Close the QGIS project before --overwrite (Stormdrain.gpkg is locked while open).
+- Re-running step 3 rebuilds gravity_mains_crossings, so re-run step 5 after it.
