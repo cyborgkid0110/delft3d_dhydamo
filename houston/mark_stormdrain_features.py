@@ -40,6 +40,7 @@ MARKS = {
     "open_drains_railroad": ("open_drains", "LINETYPE", ["Railroad Ditch"]),
     "open_drains_offroad": ("open_drains", "LINETYPE",
                             ["Offroad Channel - Manmade", "Offroad Channel - Natural"]),
+    "discharge_points_outfall": ("discharge_points", "DISCHRGTYP", ["Outfall"]),
 }
 
 

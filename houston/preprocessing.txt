@@ -17,16 +17,42 @@ Houston preprocessing (run from repo root, in order)
    conda run -n hydrolib_env python houston/remove_stormdrain_features.py houston/houston_white_oak_bayou --overwrite
 
 5. Remove gravity_mains_crossings with an endpoint on a manhole / inlet / fitting
-   (--tol 0 = exact match; --tol 0.001 also catches float noise)
+   (default --tol 0.01 m absorbs the ~mm coordinate noise between pipe ends and nodes; --tol 0 = exact)
    conda run -n hydrolib_env python houston/remove_by_endpoint.py houston/houston_white_oak_bayou --overwrite
+
+6. Remove gravity_mains_crossings whose BOTH endpoints join an open_drains_offroad endpoint
+   conda run -n hydrolib_env python houston/remove_by_endpoint.py houston/houston_white_oak_bayou --nodes open_drains_offroad --require both --overwrite
 
 Optional: remove source-layer features that match a mask layer
    (--match id|equals|intersects|within, default id on OBJECTID)
    conda run -n hydrolib_env python houston/remove_by_mask.py houston/houston_white_oak_bayou gravity_mains gravity_mains_crossings --overwrite
    conda run -n hydrolib_env python houston/remove_by_mask.py houston/houston_white_oak_bayou open_drains open_drains_roadside --overwrite
 
+7. Connect outfall pipes to off-road channels (snap / trim overshoot / perpendicular extension)
+   (targets: pipes ending on an Outfall discharge point or Drain Node fitting, or PIPETYPE=Outfall;
+    --snap-dist 2 m, --max-dist 20 m; channels are split at every connection; QA layer outfall_connections)
+   conda run -n hydrolib_env python houston/connect_outfalls_to_channels.py houston/houston_white_oak_bayou --dry-run
+   conda run -n hydrolib_env python houston/connect_outfalls_to_channels.py houston/houston_white_oak_bayou --overwrite
+
+8. T-junctions between open_drains / gravity_mains (endpoint of one line on the middle of another)
+   (run LAST, after all removals and step 7; --action mark = t_junctions point layer only,
+    split = cut host lines so 3 branches share the node, both = split + mark)
+   conda run -n hydrolib_env python houston/fix_t_junctions.py houston/houston_white_oak_bayou
+   conda run -n hydrolib_env python houston/fix_t_junctions.py houston/houston_white_oak_bayou --action both --overwrite
+
 Notes
-- Fill / remove scripts (2, 4, 5, mask): without --overwrite they copy the folder to <dir>_cleaned;
+- Fill / remove / split / connect scripts (2, 4, 5, 6, 7, 8 split, mask): without --overwrite they copy the folder to <dir>_cleaned;
   --dry-run only prints counts.
+- Steps 7 and 8 do not touch mark layers (gravity_mains_crossings, open_drains_*); split pieces keep their host's OBJECTID.
 - Close the QGIS project before --overwrite (Stormdrain.gpkg is locked while open).
-- Re-running step 3 rebuilds gravity_mains_crossings, so re-run step 5 after it.
+- Re-running step 3 rebuilds gravity_mains_crossings, so re-run steps 5 and 6 after it.
+
+create a script to connect outfall to offroad channels.
+
+có 2 cách để kết nối outfall đến kênh mương:
+(1) chỉnh vị trí endpoint của các nhánh gravity_mains sao cho endpoint được nối với 1 khớp node trong linestring của nhánh. với cách này, vị trí chỉnh endpoint không nên quá xa vị trí ban đầu, và chỉ nên dùng cách này khi endpoint gần khớp node của kênh mương, hoặc là nhánh gravity_mains đó đang bị kéo dài đến mức mà cắt qua (crossing) kênh mương.
+(2) từ endpoint của nhánh gravity_mains gần kênh mương nhất hoặc tại 1 discharge points, kéo dài branch chứa điểm này bằng cách vẽ thêm 1 đoạn line segment của branch (vẫn thuộc branch đó). đoạn nối thêm vuông góc với đoạn line segment của branch  gần nhất tại điểm đó, và 1 endpoint của đoạn này phải nằm trên kênh mương (điều này có thể tạo ra T-junctions, do đó cần xử lý như script trước)
+
+các đối tượng sau cần xét đến để áp dụng 2 cách kia:
+- các nhánh gravity_mains có 1 endpoint trùng vị trí chính xác với node discharge_point có DISCHRGTYP=Outfall hoặc node fitting có FITTINGTYPE=Drain Node
+- các nhánh gravity_mains có PIPETYPE=Outfall
