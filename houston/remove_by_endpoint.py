@@ -1,14 +1,26 @@
 """
-Remove line features whose start OR end point coincides with a node point.
+Remove line features whose start and/or end point coincides with a node.
 
 Default: drop gravity_mains_crossings features (from
 mark_stormdrain_features.py) that have an endpoint on a manhole, inlet or
 fitting -- i.e. pipes that are actually connected to the drainage network and
 should therefore not be treated as crossings.
 
+Node layers (--nodes) may be point layers or line layers; for a line layer the
+start and end point of every part are used as nodes, so a feature "connects"
+to a line only at that line's endpoints, not anywhere along it.
+
+--require either (default)  remove if the start OR the end point matches
+--require both              remove only if the start AND the end point match
+A feature endpoint matches when it is on a node of ANY of the --nodes layers.
+
 An endpoint matches when it lies within --tol metres of a node point. The
-default --tol 0 means an exact coordinate match; a small tolerance (e.g. 0.001)
-also catches endpoints that differ from the node only by floating-point noise.
+default is 1 cm, not an exact match: in the source data, line endpoints and
+node points that represent the same location often differ by 0.1-2 mm
+(coordinate noise), so exact matching misses them. In White Oak Bayou the
+endpoint-to-nearest-node distances show a clean gap between ~2 mm and 2 cm, so
+1 cm catches the noise without grabbing genuinely separate nodes. Use --tol 0
+for strict exact matching.
 
 By default this writes a full copy of the dataset folder to "<input>_cleaned"
 next to it, leaving the original untouched. Pass --overwrite to write directly
@@ -17,9 +29,13 @@ back into the given dataset folder instead.
 Usage:
     conda run -n hydrolib_env python houston/remove_by_endpoint.py \
         houston/houston_white_oak_bayou --overwrite
-    conda run -n hydrolib_env python houston/remove_by_endpoint.py <dir> --tol 0.001 --dry-run
+    conda run -n hydrolib_env python houston/remove_by_endpoint.py <dir> --tol 0 --dry-run
     conda run -n hydrolib_env python houston/remove_by_endpoint.py <dir> \
         --layer gravity_mains --nodes manholes --dry-run
+
+    # crossings whose BOTH ends join an offroad channel endpoint
+    conda run -n hydrolib_env python houston/remove_by_endpoint.py <dir> \
+        --nodes open_drains_offroad --require both --overwrite
 """
 
 from __future__ import annotations
@@ -38,18 +54,47 @@ DEFAULT_LAYER = "gravity_mains_crossings"
 DEFAULT_NODES = ["manholes", "inlets", "fittings"]
 
 
-def endpoint_hits(lines: gpd.GeoDataFrame, nodes: gpd.GeoDataFrame, tol: float) -> np.ndarray:
-    """Boolean array over `lines`: True where the start or end point is within tol of a node."""
-    if nodes.empty:
-        return np.zeros(len(lines), dtype=bool)
-    tree = cKDTree(shapely.get_coordinates(nodes.geometry.values))
-    hit = np.zeros(len(lines), dtype=bool)
-    for idx in (0, -1):
-        ends = shapely.get_point(lines.geometry.values, idx)
-        valid = ~shapely.is_missing(ends)
-        dist, _ = tree.query(shapely.get_coordinates(ends[valid]))
-        hit[valid] |= dist <= tol
-    return hit
+def line_ends(geoms: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(start xy, end xy, valid mask) per geometry; works for (Multi)LineStrings.
+
+    For a MultiLineString the start is the first vertex of the first part and
+    the end the last vertex of the last part. Missing/empty geometries are
+    flagged invalid (their xy rows are NaN).
+    """
+    coords, owner = shapely.get_coordinates(geoms, return_index=True)
+    n = len(geoms)
+    first = np.searchsorted(owner, np.arange(n), side="left")
+    last = np.searchsorted(owner, np.arange(n), side="right") - 1
+    valid = last >= first
+    start = np.full((n, 2), np.nan)
+    end = np.full((n, 2), np.nan)
+    start[valid] = coords[first[valid]]
+    end[valid] = coords[last[valid]]
+    return start, end, valid
+
+
+def node_coords(nodes: gpd.GeoDataFrame) -> np.ndarray:
+    """Node xy: the points themselves, or every part's endpoints for a line layer."""
+    if nodes.geom_type.isin(["LineString", "MultiLineString"]).any():
+        parts = nodes.geometry.explode(index_parts=False).values
+        start, end, valid = line_ends(parts)
+        return np.vstack([start[valid], end[valid]])
+    return shapely.get_coordinates(nodes.geometry.values)
+
+
+def endpoint_hits(lines: gpd.GeoDataFrame, nodes: gpd.GeoDataFrame,
+                  tol: float) -> tuple[np.ndarray, np.ndarray]:
+    """(start_hit, end_hit) boolean arrays over `lines`: endpoint within tol of a node."""
+    start_hit = np.zeros(len(lines), dtype=bool)
+    end_hit = np.zeros(len(lines), dtype=bool)
+    xy = node_coords(nodes)
+    if len(xy) == 0:
+        return start_hit, end_hit
+    tree = cKDTree(xy)
+    start, end, valid = line_ends(lines.geometry.values)
+    start_hit[valid] = tree.query(start[valid])[0] <= tol
+    end_hit[valid] = tree.query(end[valid])[0] <= tol
+    return start_hit, end_hit
 
 
 def main():
@@ -62,9 +107,13 @@ def main():
                         help=f"line layer to remove features from (default: {DEFAULT_LAYER})")
     parser.add_argument("--nodes", nargs="+", default=DEFAULT_NODES,
                         help=f"point layers to test endpoints against "
-                             f"(default: {' '.join(DEFAULT_NODES)})")
-    parser.add_argument("--tol", type=float, default=0.0,
-                        help="match distance in metres (default: 0 = exact match)")
+                             f"(default: {' '.join(DEFAULT_NODES)}); "
+                             f"line layers contribute their endpoints")
+    parser.add_argument("--require", choices=["either", "both"], default="either",
+                        help="remove when either endpoint matches, or only when both do "
+                             "(default: either)")
+    parser.add_argument("--tol", type=float, default=0.01,
+                        help="match distance in metres (default: 0.01; 0 = exact match)")
     parser.add_argument("--dest", type=Path, default=None,
                         help="where to write the cleaned copy (default: '<dataset_dir>_cleaned')")
     parser.add_argument("--overwrite", action="store_true",
@@ -81,18 +130,22 @@ def main():
     lines = gpd.read_file(gpkg_path, layer=args.layer, engine="pyogrio")
     print(f"Read {args.layer}: {len(lines)} rows")
 
-    drop = np.zeros(len(lines), dtype=bool)
+    start_hit = np.zeros(len(lines), dtype=bool)
+    end_hit = np.zeros(len(lines), dtype=bool)
     for node_layer in args.nodes:
         nodes = gpd.read_file(gpkg_path, layer=node_layer, engine="pyogrio")
         if nodes.crs != lines.crs:
             nodes = nodes.to_crs(lines.crs)
-        hit = endpoint_hits(lines, nodes, args.tol)
-        print(f"  {node_layer} ({len(nodes)} points): {hit.sum()} features with an endpoint on it")
-        drop |= hit
+        s_hit, e_hit = endpoint_hits(lines, nodes, args.tol)
+        print(f"  {node_layer} ({len(nodes)} features): {(s_hit | e_hit).sum()} with an "
+              f"endpoint on it, {(s_hit & e_hit).sum()} with both")
+        start_hit |= s_hit
+        end_hit |= e_hit
 
+    drop = (start_hit & end_hit) if args.require == "both" else (start_hit | end_hit)
     cleaned = lines[~drop]
-    print(f"\n{args.layer}: removing {drop.sum()} of {len(lines)} (tol={args.tol} m) "
-          f"-> {len(cleaned)} remaining")
+    print(f"\n{args.layer}: removing {drop.sum()} of {len(lines)} "
+          f"(--require {args.require}, tol={args.tol} m) -> {len(cleaned)} remaining")
 
     if args.dry_run:
         print("\n--dry-run: nothing written")
