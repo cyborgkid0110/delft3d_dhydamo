@@ -36,6 +36,9 @@ Per target, in this order (P = outfall end, d = distance P -> nearest channel)
                   the perpendicular on the nearest channel segment is appended
                   to the pipe (same feature). If the foot is within --tol of a
                   channel vertex, the vertex is used.
+    extend_crosses  the extension would cross another pipe / open_drain (no
+                  node there, so it would look like a junction but not be one)
+                  -> left alone. --allow-crossing extends anyway.
     too_far       d > --max-dist -> left alone
 
 Whenever the connection point is not a channel endpoint, the channel is split
@@ -48,6 +51,16 @@ would be interior to the pipe (a T-junction) -- so the extension becomes a
 separate piece with the pipe's attributes. discharge_points / fittings are not
 moved.
 
+Network outlets (--network-outlets, off by default)
+---------------------------------------------------
+Some pipe networks end near a channel without any of the triggers above (no
+Outfall pipe, no discharge point; their last pipe is e.g. a Collector or
+Culvert), so they are never connected. With this option, after the targets
+are processed, every pipe network (lines sharing endpoints) that still
+reaches no channel gets ONE more target, trigger 'network_outlet': the pipe
+whose digitised END is a dead end (no other line ends there) nearest to a
+channel, if within --max-dist. It goes through the same steps as above.
+
 A point layer `outfall_connections` (one row per target pipe, with status,
 method distances and the connection point; skipped rows sit on P) is written
 for QA. Like the remove scripts, output goes to a copy of the dataset folder
@@ -59,6 +72,8 @@ Usage:
     conda run -n hydrolib_env python houston/connect_outfalls_to_channels.py <dir> --overwrite
     conda run -n hydrolib_env python houston/connect_outfalls_to_channels.py <dir> \
         --snap-dist 1 --max-dist 30 --overwrite
+    conda run -n hydrolib_env python houston/connect_outfalls_to_channels.py <dir> \
+        --network-outlets --overwrite
 """
 
 from __future__ import annotations
@@ -72,17 +87,21 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import shapely
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString, MultiLineString, Point
 from shapely.ops import nearest_points, substring
 
-from fix_t_junctions import as_single, cut
+from fix_t_junctions import as_single, cut, warn_stale_marks
 
 GPKG = Path("Stormdrain.gpkg")
 PIPES, DRAINS = "gravity_mains", "open_drains"
 CHANNEL_TYPES = ["Offroad Channel - Manmade", "Offroad Channel - Natural"]
 MARK_LAYER = "outfall_connections"
 KEY = "OBJECTID"
+# statuses after which the outfall end lies on a channel
+CONNECTED = {"connected", "trim_vertex", "trim_split", "snap_vertex", "extend", "shared"}
 
 
 def main():
@@ -98,6 +117,12 @@ def main():
     parser.add_argument("--max-dist", type=float, default=20.0,
                         help="max gap to bridge by extension / max overshoot to trim "
                              "(default: 20.0)")
+    parser.add_argument("--allow-crossing", action="store_true",
+                        help="method 2: extend even when the new segment crosses another line")
+    parser.add_argument("--network-outlets", action="store_true",
+                        help="also connect pipe networks that reach no channel after the "
+                             "targets are processed, at their dead-end outlet nearest to a "
+                             "channel (see 'Network outlets' above)")
     parser.add_argument("--dest", type=Path, default=None,
                         help="where to write the copy (default: '<dataset_dir>_cleaned')")
     parser.add_argument("--overwrite", action="store_true",
@@ -137,6 +162,7 @@ def main():
     if len(ch_idx) == 0:
         sys.exit("error: no off-road channels in open_drains")
     ch_tree = shapely.STRtree(geoms[ch_idx])
+    all_tree = shapely.STRtree(geoms)
     drain_tree = shapely.STRtree(geoms[other_drain_idx])
     v_xy, v_owner = shapely.get_coordinates(geoms[ch_idx], return_index=True)
     v_tree = cKDTree(v_xy)
@@ -214,21 +240,8 @@ def main():
 
     # ---- process ---------------------------------------------------------------
     rows, done_xy = [], []
-    for i in targets:
-        st, et = s_trig[i], e_trig[i]
-        on_ch = [w for w, xy in (("start", starts[i]), ("end", ends[i])) if chan_dist(xy)[1] <= tol]
-        if on_ch:                                  # already discharges into a channel
-            which = on_ch[0]
-        elif pd.notna(st) != pd.notna(et):
-            which = "start" if pd.notna(st) else "end"
-        else:
-            outlets = [w for w in ("start", "end") if is_outlet(i, w)]
-            if len(outlets) == 1:
-                which = outlets[0]
-            else:
-                which = "start" if chan_dist(starts[i])[1] < chan_dist(ends[i])[1] else "end"
-        trigger = (st if which == "start" else et)
-        trigger = trigger if pd.notna(trigger) else "pipetype"
+
+    def process(i, which, trigger):
         P = tuple(starts[i] if which == "start" else ends[i])
         rec = dict(pool_i=i, outfall_end=which, trigger=trigger, status=None,
                    channel=None, moved=0.0, added=0.0, trimmed=0.0, P=P, xy=P)
@@ -237,7 +250,7 @@ def main():
         # outfall ends already connected by an earlier target (pipes converging)
         if any(np.hypot(P[0] - q[0], P[1] - q[1]) <= tol for q in done_xy):
             rec["status"] = "shared"
-            continue
+            return
 
         c, d = chan_dist(P)
         if d <= tol:                                      # already on a channel
@@ -247,16 +260,16 @@ def main():
             move_ends(P, Q)
             done_xy.append(P)
             rec.update(status="connected", channel=c, xy=Q, moved=float(np.hypot(Q[0] - P[0], Q[1] - P[1])))
-            continue
+            return
 
         if not is_outlet(i, which):
             rec["status"] = "not_outfall"
-            continue
+            return
 
         if len(other_drain_idx) and len(drain_tree.query(Point(P), predicate="dwithin",
                                                          distance=tol)):
             rec["status"] = "on_drain"
-            continue
+            return
 
         coords = list(cur[i].coords)
         if which == "start":
@@ -275,7 +288,7 @@ def main():
         if X is not None and L - X_chain <= args.max_dist:
             if ends_at(P, exclude=i):
                 rec.update(status="crossing_shared", channel=X_ch)
-                continue
+                return
             dv, V, vc = nearest_vertex(X)
             if dv <= args.snap_dist:
                 Q, status, c_used = on_channel(vc, V), "trim_vertex", vc
@@ -287,7 +300,7 @@ def main():
             done_xy.append(P)
             rec.update(status=status, channel=c_used, xy=Q, trimmed=L - X_chain,
                        moved=float(np.hypot(Q[0] - X[0], Q[1] - X[1])))
-            continue
+            return
 
         # method 1b: snap onto a nearby channel vertex
         dv, V, vc = nearest_vertex(P)
@@ -296,12 +309,18 @@ def main():
             move_ends(P, Q)
             done_xy.append(P)
             rec.update(status="snap_vertex", channel=vc, xy=Q, moved=dv)
-            continue
+            return
 
         # method 2: append a segment perpendicular onto the nearest channel
         if d <= args.max_dist:
             foot = nearest_points(Point(P), geoms[c])[1].coords[0]
             dfv, FV, fvc = nearest_vertex(foot)
+            if not args.allow_crossing:
+                seg = LineString([P, FV if dfv <= tol else foot])
+                inner = substring(seg, tol, seg.length - tol)
+                if seg.length > 2 * tol and any(h != i for h in all_tree.query(inner, predicate="intersects")):
+                    rec.update(status="extend_crosses", channel=c)
+                    return
             Q = on_channel(fvc, FV) if dfv <= tol else on_channel(c, foot)
             set_oriented(i, which, coords + [Q])
             if ends_at(P, exclude=i):
@@ -311,14 +330,50 @@ def main():
                 splits.setdefault(i, []).append(P)
             done_xy.append(P)
             rec.update(status="extend", channel=c, xy=Q, added=float(np.hypot(Q[0] - P[0], Q[1] - P[1])))
-            continue
+            return
 
         rec.update(status="too_far", channel=c)
+
+
+    for i in targets:
+        st, et = s_trig[i], e_trig[i]
+        on_ch = [w for w, xy in (("start", starts[i]), ("end", ends[i])) if chan_dist(xy)[1] <= tol]
+        if on_ch:                                  # already discharges into a channel
+            which = on_ch[0]
+        elif pd.notna(st) != pd.notna(et):
+            which = "start" if pd.notna(st) else "end"
+        else:
+            outlets = [w for w in ("start", "end") if is_outlet(i, w)]
+            if len(outlets) == 1:
+                which = outlets[0]
+            else:
+                which = "start" if chan_dist(starts[i])[1] < chan_dist(ends[i])[1] else "end"
+        trigger = (st if which == "start" else et)
+        process(i, which, trigger if pd.notna(trigger) else "pipetype")
+
+    if args.network_outlets:
+        # pipe networks (lines sharing endpoints, on the original geometry) that
+        # still reach no channel: connect the dead-end digitised END nearest to
+        # a channel, one per network
+        pairs = e_tree.query_pairs(tol, output_type="ndarray")
+        _, comp = connected_components(
+            coo_matrix((np.ones(len(pairs)), (e_owner[pairs[:, 0]], e_owner[pairs[:, 1]])),
+                       shape=(n, n)), directed=False)
+        reached = set(comp[ch_idx]) | {comp[r["pool_i"]] for r in rows if r["status"] in CONNECTED}
+        best = {}
+        for i in pipe_idx:
+            if comp[i] in reached or ends_at(ends[i], exclude=i):
+                continue
+            d = chan_dist(ends[i])[1]
+            if d <= args.max_dist and d < best.get(comp[i], (np.inf, None))[0]:
+                best[comp[i]] = (d, i)
+        for _, i in sorted(best.values()):
+            process(i, "end", "network_outlet")
 
     # ---- report ----------------------------------------------------------------
     res = pd.DataFrame(rows)
     order = ["connected", "trim_vertex", "trim_split", "snap_vertex", "extend",
-             "shared", "not_outfall", "on_drain", "crossing_shared", "too_far"]
+             "shared", "not_outfall", "on_drain", "crossing_shared", "extend_crosses", "too_far"]
     counts = res["status"].value_counts()
     print(f"Targets: {len(res)} gravity_mains "
           f"({', '.join(f'{k}={v}' for k, v in res['trigger'].value_counts().items())})")
@@ -390,6 +445,7 @@ def main():
     }, geometry=[Point(xy) for xy in res["xy"]], crs=pipes.crs)
     marks.to_file(dest_gpkg, layer=MARK_LAYER, driver="GPKG", engine="pyogrio")
     print(f"Wrote {dest_gpkg}:{MARK_LAYER} ({len(marks)} rows)")
+    warn_stale_marks(dest_gpkg, exclude=[MARK_LAYER])
 
     print(f"\nDone. Output: {dest_dir}")
 

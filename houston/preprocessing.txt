@@ -30,22 +30,47 @@ Optional: remove source-layer features that match a mask layer
 
 7. Connect outfall pipes to off-road channels (snap / trim overshoot / perpendicular extension)
    (targets: pipes ending on an Outfall discharge point or Drain Node fitting, or PIPETYPE=Outfall;
-    --snap-dist 2 m, --max-dist 20 m; channels are split at every connection; QA layer outfall_connections)
+    --snap-dist 2 m, --max-dist 20 m; channels are split at every connection; QA layer outfall_connections;
+    --network-outlets: also connect pipe networks without any trigger that still reach no channel, at their
+    dead-end outlet nearest to a channel -- 24 networks / 226 pipes in White Oak Bayou;
+    extensions that would cross another line are skipped (status extend_crosses; --allow-crossing to force).
+    Large --max-dist creates long artificial pipes: at 110 m, 87 extensions would cross other lines)
    conda run -n hydrolib_env python houston/connect_outfalls_to_channels.py houston/houston_white_oak_bayou --dry-run
-   conda run -n hydrolib_env python houston/connect_outfalls_to_channels.py houston/houston_white_oak_bayou --overwrite
+   conda run -n hydrolib_env python houston/connect_outfalls_to_channels.py houston/houston_white_oak_bayou --network-outlets --overwrite
 
 8. T-junctions between open_drains / gravity_mains (endpoint of one line on the middle of another)
-   (run LAST, after all removals and step 7; --action mark = t_junctions point layer only,
-    split = cut host lines so 3 branches share the node, both = split + mark)
-   conda run -n hydrolib_env python houston/fix_t_junctions.py houston/houston_white_oak_bayou
-   conda run -n hydrolib_env python houston/fix_t_junctions.py houston/houston_white_oak_bayou --action both --overwrite
+   (run LAST, after all removals and step 7; --action mark (DEFAULT) = t_junctions point layer only, NOTHING is cut,
+    even with --overwrite; split = cut host lines so 3 branches share the node, both = split + mark;
+    --snap-dist D: also dangling ends stopping up to D m short of a line (look like a T, but no contact);
+    0.5 m -> ~100 extra junctions in White Oak Bayou; review with --action mark first, kind=near)
+   conda run -n hydrolib_env python houston/fix_t_junctions.py houston/houston_white_oak_bayou --snap-dist 0.5
+   conda run -n hydrolib_env python houston/fix_t_junctions.py houston/houston_white_oak_bayou --action both --snap-dist 0.5 --overwrite
+
+Check (run AFTER steps 7 and 8, they rewrite the layers): connectivity from a reference branch
+   (DFS over gravity_mains + open_drains sharing an endpoint; mark layer connected_network, rewritten each run;
+    --t-junctions also follows endpoint-on-interior contacts; near misses up to --gap-dist 1 m are printed;
+    raise --tol to bridge real gaps. Prefer --ref-objectid: fids are renumbered by every rewrite)
+   conda run -n hydrolib_env python houston/check_connectivity.py houston/houston_white_oak_bayou --ref-layer open_drains --ref-objectid 197064
 
 Notes
 - Fill / remove / split / connect scripts (2, 4, 5, 6, 7, 8 split, mask): without --overwrite they copy the folder to <dir>_cleaned;
   --dry-run only prints counts.
 - Steps 7 and 8 do not touch mark layers (gravity_mains_crossings, open_drains_*); split pieces keep their host's OBJECTID.
+- Steps 7 and 8 rewrite open_drains / gravity_mains and renumber ALL fids: fid columns of layers written before
+  (connected_network, t_junctions, outfall_connections) then point at other features (a warning lists them).
+  t_junctions written by step 8 --action both has split=1: those junctions were resolved; its fids are pre-split.
 - Close the QGIS project before --overwrite (Stormdrain.gpkg is locked while open).
 - Re-running step 3 rebuilds gravity_mains_crossings, so re-run steps 5 and 6 after it.
+
+python houston/mark_stormdrain_features.py houston/houston_white_oak_bayou
+python houston/remove_by_endpoint.py houston/houston_white_oak_bayou
+python houston/remove_by_endpoint.py houston/houston_white_oak_bayou_cleaned --nodes open_drains_offroad --require either --overwrite
+python houston/remove_by_mask.py houston/houston_white_oak_bayou_cleaned gravity_mains gravity_mains_crossings --overwrite
+python houston/remove_by_mask.py houston/houston_white_oak_bayou_cleaned open_drains open_drains_railroad --overwrite
+python houston/remove_by_mask.py houston/houston_white_oak_bayou_cleaned open_drains open_drains_roadside --overwrite
+python houston/connect_outfalls_to_channels.py houston/houston_white_oak_bayou_cleaned --max-dist 100 --network-outlet --overwrite
+python houston/fix_t_junctions.py houston/houston_white_oak_bayou_cleaned --action both --snap-dist 0.5 --overwrite
+python houston/check_connectivity.py houston/houston_white_oak_bayou_cleaned --ref-layer open_drains --ref-objectid 197064
 
 create a script to connect outfall to offroad channels.
 
@@ -56,3 +81,21 @@ có 2 cách để kết nối outfall đến kênh mương:
 các đối tượng sau cần xét đến để áp dụng 2 cách kia:
 - các nhánh gravity_mains có 1 endpoint trùng vị trí chính xác với node discharge_point có DISCHRGTYP=Outfall hoặc node fitting có FITTINGTYPE=Drain Node
 - các nhánh gravity_mains có PIPETYPE=Outfall
+
+objectid
+material
+width
+height
+mainshape
+pipetype
+downelev
+upelev
+
+objected
+linetype
+width
+depth
+bedmaterial
+sidematerial
+bankwidth
+
