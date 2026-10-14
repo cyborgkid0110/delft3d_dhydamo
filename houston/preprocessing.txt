@@ -34,17 +34,17 @@ Optional: remove source-layer features that match a mask layer
    conda run -n hydrolib_env python houston/connect_outfalls_to_channels.py houston/houston_white_oak_bayou --dry-run
    conda run -n hydrolib_env python houston/connect_outfalls_to_channels.py houston/houston_white_oak_bayou --overwrite
 
-7b. Convert too-far outfall discharge_points to inlets
+7b. Convert too-far outfall discharge_points to inlets & normalise inlets/manholes
    (run AFTER step 7 --overwrite; reads outfall_connections QA layer;
     discharge_points Outfall at the outfall-end of a too_far pipe + orphan outfalls
     are converted to inlets: DEPTH=3 m (9.84252 ft), RIMELEV=DEM(m)*3.28084,
     INVERTELEV=RIMELEV-DEPTH; removed from discharge_points + discharge_points_outfall;
-    in the same run, existing inlets with DEPTH NULL/non-numeric/<=0 are repaired
+    in the same run, existing inlets and manholes with DEPTH NULL/non-numeric/<=0 are repaired
     to DEPTH=3 m. Positive existing DEPTH values are kept unchanged. For a repaired
-    inlet, the script uses existing RIMELEV first, then INVERTELEV, then DEM, then
+    node, the script uses existing RIMELEV (>0) first, then INVERTELEV (>0), then DEM, then
     the explicit fallback RIMELEV=0 ft / INVERTELEV=-9.84252 ft;
     QA layer: converted_outfalls; --revert undoes converted outfalls only and does
-    not restore the normalised attributes of pre-existing inlets)
+    not restore the normalised attributes of pre-existing inlets/manholes)
    conda run -n delft3d_dhydamo python houston/outfalls_to_inlets.py houston/houston_white_oak_bayou --dry-run
    conda run -n delft3d_dhydamo python houston/outfalls_to_inlets.py houston/houston_white_oak_bayou --overwrite
    # Để hoàn tác bước này:

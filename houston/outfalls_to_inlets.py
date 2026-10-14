@@ -31,11 +31,12 @@ Logic
        INLETMAT   : None
        DigitizedBy: 'auto'
        other cols : None / NaN
-6. Normalise existing inlets whose DEPTH is missing, non-numeric, zero or
-   negative.  Positive existing DEPTH values are preserved.  Normalised rows
-   receive DEPTH=3 m; existing RIMELEV takes priority, otherwise INVERTELEV,
-   then DEM, then the explicit fallback RIMELEV=0 ft.
-7. Append new rows and write normalised existing rows to layer 'inlets'.
+6. Normalise existing inlets and manholes whose DEPTH is missing, non-numeric,
+   zero or negative.  Positive existing DEPTH values are preserved.  Normalised
+   rows receive DEPTH=3 m; existing RIMELEV (> 0) takes priority, otherwise
+   INVERTELEV (> 0), then DEM, then the explicit fallback RIMELEV=0 ft.
+7. Append new rows and write normalised existing rows to layer 'inlets', and
+   write normalised rows to layer 'manholes'.
 8. Remove converted points from 'discharge_points' (and mark layer
    'discharge_points_outfall') unless --keep-dp is given.
 9. Write a QA point layer 'converted_outfalls' (source, pipe_OBJECTID,
@@ -127,52 +128,59 @@ def sample_dem(tifs: list[Path], points_gdf: gpd.GeoDataFrame,
     return elevs
 
 
-def invalid_depth_mask(inlets: gpd.GeoDataFrame) -> np.ndarray:
-    """Return True for inlet rows that need normalising to DEPTH_FT.
+def invalid_depth_mask(nodes: gpd.GeoDataFrame) -> np.ndarray:
+    """Return True for node rows that need normalising/filling."""
+    depths = pd.to_numeric(nodes["DEPTH"], errors="coerce").to_numpy(dtype=float)
+    rims = pd.to_numeric(nodes["RIMELEV"], errors="coerce").to_numpy(dtype=float)
+    inverts = pd.to_numeric(nodes["INVERTELEV"], errors="coerce").to_numpy(dtype=float)
+    return (~np.isfinite(depths) | (depths <= 0) |
+            ~np.isfinite(rims) | (rims <= 0) |
+            ~np.isfinite(inverts))
 
-    A positive existing DEPTH is intentionally left unchanged, even when it is
-    not 3 m.  This protects surveyed/engineered inlets from this remediation
-    step, which only repairs missing or invalid depth records.
-    """
-    depths = pd.to_numeric(inlets["DEPTH"], errors="coerce").to_numpy(dtype=float)
-    return ~np.isfinite(depths) | (depths <= 0)
 
-
-def normalise_invalid_inlets(
-    inlets: gpd.GeoDataFrame,
+def normalise_invalid_nodes(
+    nodes: gpd.GeoDataFrame,
     dem_elevations_m: np.ndarray,
 ) -> tuple[gpd.GeoDataFrame, dict[str, int]]:
-    """Fill invalid-depth inlet elevations and set their DEPTH to DEPTH_FT.
+    """Fill invalid-depth node elevations and set their DEPTH to DEPTH_FT.
 
-    For each invalid-depth row, RIMELEV remains authoritative when present;
-    otherwise INVERTELEV is used to derive RIMELEV.  If neither is usable,
-    DEM elevation supplies RIMELEV.  Rows outside DEM coverage receive the
-    explicit, traceable fallback RIMELEV=0 ft and INVERTELEV=-DEPTH_FT.
+    Applies to both inlets and manholes.
+    1. For rows with missing/invalid DEPTH (<= 0 or NaN):
+       DEPTH is set to DEPTH_FT (3 m). Authoritative RIMELEV (> 0) is kept;
+       otherwise INVERTELEV (> 0) is used to derive RIMELEV. If neither is usable,
+       DEM elevation supplies RIMELEV. Fallback: RIMELEV=0 ft.
+       INVERTELEV is set to RIMELEV - DEPTH_FT.
+    2. For rows with valid DEPTH (> 0) but missing RIMELEV or INVERTELEV:
+       - If RIMELEV > 0 and INVERTELEV missing: INVERTELEV = RIMELEV - DEPTH
+       - If INVERTELEV > 0 and RIMELEV missing/<=0: RIMELEV = INVERTELEV + DEPTH
+       - If both missing: RIMELEV from DEM, INVERTELEV = RIMELEV - DEPTH
+    All elevations rounded to 5 decimal places.
     """
-    if len(dem_elevations_m) != len(inlets):
-        raise ValueError("dem_elevations_m must have one value per inlet row")
+    if len(dem_elevations_m) != len(nodes):
+        raise ValueError("dem_elevations_m must have one value per node row")
 
-    updated = inlets.copy()
-    invalid = invalid_depth_mask(updated)
+    updated = nodes.copy()
+    depths = pd.to_numeric(updated["DEPTH"], errors="coerce").to_numpy(dtype=float)
+    rims = pd.to_numeric(updated["RIMELEV"], errors="coerce").to_numpy(dtype=float)
+    inverts = pd.to_numeric(updated["INVERTELEV"], errors="coerce").to_numpy(dtype=float)
+
+    invalid_depth = ~np.isfinite(depths) | (depths <= 0)
     report = {
-        "invalid_depth": int(invalid.sum()),
+        "invalid_depth": int(invalid_depth.sum()),
         "from_rim": 0,
         "from_invert": 0,
         "from_dem": 0,
         "fallback": 0,
+        "extra_repaired": 0,
     }
-    if not invalid.any():
-        return updated, report
 
-    rims = pd.to_numeric(updated["RIMELEV"], errors="coerce").to_numpy(dtype=float)
-    inverts = pd.to_numeric(updated["INVERTELEV"], errors="coerce").to_numpy(dtype=float)
-
-    for pos in np.flatnonzero(invalid):
+    # Step 1: Repair rows with invalid DEPTH
+    for pos in np.flatnonzero(invalid_depth):
         rim = rims[pos]
         invert = inverts[pos]
-        if np.isfinite(rim):
+        if np.isfinite(rim) and rim > 0:
             report["from_rim"] += 1
-        elif np.isfinite(invert):
+        elif np.isfinite(invert) and invert > 0:
             rim = invert + DEPTH_FT
             report["from_invert"] += 1
         elif np.isfinite(dem_elevations_m[pos]):
@@ -185,8 +193,40 @@ def normalise_invalid_inlets(
         updated.iloc[pos, updated.columns.get_loc("RIMELEV")] = round(float(rim), 5)
         updated.iloc[pos, updated.columns.get_loc("INVERTELEV")] = round(float(rim - DEPTH_FT), 5)
         updated.iloc[pos, updated.columns.get_loc("DEPTH")] = DEPTH_FT
+        rims[pos] = rim
+        inverts[pos] = rim - DEPTH_FT
+        depths[pos] = DEPTH_FT
+
+    # Step 2: Complete rows that have valid DEPTH but missing RIMELEV or INVERTELEV
+    valid_d = np.isfinite(depths) & (depths > 0)
+    missing_inv = valid_d & ~np.isfinite(inverts) & (np.isfinite(rims) & (rims > 0))
+    for pos in np.flatnonzero(missing_inv):
+        inv = rims[pos] - depths[pos]
+        updated.iloc[pos, updated.columns.get_loc("INVERTELEV")] = round(float(inv), 5)
+        inverts[pos] = inv
+        report["extra_repaired"] += 1
+
+    missing_rim = valid_d & (~np.isfinite(rims) | (rims <= 0)) & np.isfinite(inverts) & (inverts > 0)
+    for pos in np.flatnonzero(missing_rim):
+        rim = inverts[pos] + depths[pos]
+        updated.iloc[pos, updated.columns.get_loc("RIMELEV")] = round(float(rim), 5)
+        rims[pos] = rim
+        report["extra_repaired"] += 1
+
+    missing_both = valid_d & (~np.isfinite(rims) | (rims <= 0)) & ~np.isfinite(inverts)
+    for pos in np.flatnonzero(missing_both):
+        if np.isfinite(dem_elevations_m[pos]):
+            rim = dem_elevations_m[pos] * FT_PER_M
+        else:
+            rim = 0.0
+        updated.iloc[pos, updated.columns.get_loc("RIMELEV")] = round(float(rim), 5)
+        updated.iloc[pos, updated.columns.get_loc("INVERTELEV")] = round(float(rim - depths[pos]), 5)
+        report["extra_repaired"] += 1
 
     return updated, report
+
+
+normalise_invalid_inlets = normalise_invalid_nodes
 
 
 def revert_conversion(gpkg_path: Path):
@@ -296,13 +336,16 @@ def main():
     # 1. Load data
     # ------------------------------------------------------------------
     print("Reading layers ...")
-    oc      = gpd.read_file(gpkg_path, layer="outfall_connections", engine="pyogrio")
-    dp      = gpd.read_file(gpkg_path, layer="discharge_points",    engine="pyogrio")
-    inlets  = gpd.read_file(gpkg_path, layer="inlets",              engine="pyogrio")
+    oc       = gpd.read_file(gpkg_path, layer="outfall_connections", engine="pyogrio")
+    dp       = gpd.read_file(gpkg_path, layer="discharge_points",    engine="pyogrio")
+    inlets   = gpd.read_file(gpkg_path, layer="inlets",              engine="pyogrio")
+    manholes = gpd.read_file(gpkg_path, layer="manholes",            engine="pyogrio")
 
     gpkg_crs = str(inlets.crs)
     invalid_existing = invalid_depth_mask(inlets)
+    invalid_existing_mh = invalid_depth_mask(manholes)
     print(f"existing inlets with missing/invalid DEPTH: {int(invalid_existing.sum())}")
+    print(f"existing manholes with missing/invalid DEPTH: {int(invalid_existing_mh.sum())}")
 
     # ------------------------------------------------------------------
     # 2. Find too-far pipes and match their outfall ends to discharge_points
@@ -356,7 +399,7 @@ def main():
         print(f"  Orphan discharge_points_outfall (no pipe within {args.orphan_dist} ft): "
               f"{orphan_count}")
 
-    if not matched_indices and not invalid_existing.any():
+    if not matched_indices and not invalid_existing.any() and not invalid_existing_mh.any():
         print("Nothing to convert or normalise.")
         return
 
@@ -382,8 +425,18 @@ def main():
         existing_dem_m[invalid_existing] = sample_dem(
             tifs, invalid_inlets, gpkg_crs, DEM_CRS
         )
-    normalised_inlets, normalise_report = normalise_invalid_inlets(
+    normalised_inlets, normalise_report = normalise_invalid_nodes(
         inlets, existing_dem_m
+    )
+
+    existing_dem_mh_m = np.full(len(manholes), np.nan)
+    if invalid_existing_mh.any():
+        invalid_manholes = manholes.loc[invalid_existing_mh]
+        existing_dem_mh_m[invalid_existing_mh] = sample_dem(
+            tifs, invalid_manholes, gpkg_crs, DEM_CRS
+        )
+    normalised_manholes, normalise_mh_report = normalise_invalid_nodes(
+        manholes, existing_dem_mh_m
     )
 
     n_no_elev = int(np.sum(np.isnan(elevs)))
@@ -408,6 +461,12 @@ def main():
           f"from INVERTELEV={normalise_report['from_invert']}, "
           f"from DEM={normalise_report['from_dem']}, "
           f"fallback={normalise_report['fallback']})")
+    print("Existing manholes normalised to DEPTH=3 m: "
+          f"{normalise_mh_report['invalid_depth']} "
+          f"(from RIMELEV={normalise_mh_report['from_rim']}, "
+          f"from INVERTELEV={normalise_mh_report['from_invert']}, "
+          f"from DEM={normalise_mh_report['from_dem']}, "
+          f"fallback={normalise_mh_report['fallback']})")
     if not args.keep_dp and len(matched_dps):
         print(f"  discharge_points to remove: {len(matched_dps)}")
 
@@ -463,6 +522,10 @@ def main():
     updated_inlets.to_file(dest_gpkg, layer="inlets", driver="GPKG", engine="pyogrio")
     print(f"Wrote {dest_gpkg}:inlets ({len(inlets)} -> {len(updated_inlets)} rows; "
           f"normalised {normalise_report['invalid_depth']})")
+
+    normalised_manholes.to_file(dest_gpkg, layer="manholes", driver="GPKG", engine="pyogrio")
+    print(f"Wrote {dest_gpkg}:manholes ({len(manholes)} rows; "
+          f"normalised {normalise_mh_report['invalid_depth']})")
 
     # ------------------------------------------------------------------
     # 9. Remove converted points from discharge_points (and mark layer)
