@@ -47,6 +47,8 @@ Usage
         houston/houston_white_oak_bayou --overwrite --keep-dp
     conda run -n delft3d_dhydamo python houston/outfalls_to_inlets.py \\
         houston/houston_white_oak_bayou --overwrite --no-orphans
+    conda run -n delft3d_dhydamo python houston/outfalls_to_inlets.py \\
+        houston/houston_white_oak_bayou --revert
 """
 
 from __future__ import annotations
@@ -121,6 +123,59 @@ def sample_dem(tifs: list[Path], points_gdf: gpd.GeoDataFrame,
     return elevs
 
 
+def revert_conversion(gpkg_path: Path):
+    """Undo conversion: remove auto inlets, restore discharge_points, drop converted_outfalls."""
+    import sqlite3
+    import pyogrio
+
+    layers = [l[0] for l in pyogrio.list_layers(gpkg_path)]
+    if "converted_outfalls" not in layers:
+        sys.exit(f"Nothing to revert in {gpkg_path}: 'converted_outfalls' layer not found.")
+
+    qa = gpd.read_file(gpkg_path, layer="converted_outfalls", engine="pyogrio")
+    inlets = gpd.read_file(gpkg_path, layer="inlets", engine="pyogrio")
+    dp = gpd.read_file(gpkg_path, layer="discharge_points", engine="pyogrio")
+
+    n_convert = len(qa)
+    print(f"Found {n_convert} converted outfalls in {gpkg_path} to revert.")
+
+    # 1. Remove auto inlets
+    inlets_clean = inlets[~inlets["OBJECTID"].isin(qa["inlet_OBJECTID"])].copy()
+    inlets_clean.to_file(gpkg_path, layer="inlets", driver="GPKG", engine="pyogrio")
+    print(f"Wrote inlets: {len(inlets)} -> {len(inlets_clean)} rows (removed {len(inlets) - len(inlets_clean)})")
+
+    # 2. Restore discharge_points
+    dp_schema = [c for c in dp.columns if c != "geometry"]
+    restored_rows = []
+    for r in qa.itertuples():
+        row = {c: None for c in dp_schema}
+        row["OBJECTID"] = int(r.src_dp_OBJECTID) if pd.notna(r.src_dp_OBJECTID) else None
+        row["FACILITYID"] = r.src_FACILITYID
+        row["LegacyID"] = r.src_FACILITYID
+        row["DISCHRGTYP"] = "Outfall"
+        row["DigitizedBy"] = "COH"
+        restored_rows.append(row)
+
+    restored_gdf = gpd.GeoDataFrame(restored_rows, geometry=qa.geometry.values, crs=dp.crs)
+    dp_restored = pd.concat([dp, restored_gdf], ignore_index=True)
+    dp_restored = gpd.GeoDataFrame(dp_restored, geometry="geometry", crs=dp.crs)
+    dp_restored.to_file(gpkg_path, layer="discharge_points", driver="GPKG", engine="pyogrio")
+    print(f"Wrote discharge_points: {len(dp)} -> {len(dp_restored)} rows (restored {n_convert})")
+
+    # 3. Re-write discharge_points_outfall mark layer
+    dp_out = dp_restored[dp_restored["DISCHRGTYP"] == "Outfall"].copy()
+    dp_out.to_file(gpkg_path, layer="discharge_points_outfall", driver="GPKG", engine="pyogrio")
+    print(f"Wrote discharge_points_outfall -> {len(dp_out)} rows")
+
+    # 4. Drop converted_outfalls QA layer from GPKG
+    with sqlite3.connect(gpkg_path) as conn:
+        conn.execute("DROP TABLE IF EXISTS converted_outfalls")
+        conn.execute("DELETE FROM gpkg_contents WHERE table_name = 'converted_outfalls'")
+        conn.execute("DELETE FROM gpkg_geometry_columns WHERE table_name = 'converted_outfalls'")
+    print("Dropped QA layer 'converted_outfalls'")
+    print(f"\nDone. Successfully reverted {gpkg_path} to state before step 7b.")
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -151,14 +206,22 @@ def main():
     parser.add_argument("--keep-dp", action="store_true",
                         help="do NOT remove converted points from discharge_points "
                              "(and discharge_points_outfall)")
+    parser.add_argument("--revert", action="store_true",
+                        help="undo step 7b: remove auto inlets, restore discharge_points, "
+                             "and drop converted_outfalls QA layer")
     parser.add_argument("--dry-run", action="store_true",
                         help="only report what would be done; write nothing")
     args = parser.parse_args()
 
     gpkg_path = args.dataset_dir / GPKG
-    dem_dir   = args.dataset_dir / DEM_DIR
     if not gpkg_path.exists():
         sys.exit(f"error: {gpkg_path} not found")
+
+    if args.revert:
+        revert_conversion(gpkg_path)
+        return
+
+    dem_dir = args.dataset_dir / DEM_DIR
     if not dem_dir.exists():
         sys.exit(f"error: DEM directory {dem_dir} not found")
 

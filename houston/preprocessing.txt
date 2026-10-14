@@ -36,11 +36,14 @@ Optional: remove source-layer features that match a mask layer
 
 7b. Convert too-far outfall discharge_points to inlets
    (run AFTER step 7 --overwrite; reads outfall_connections QA layer;
-    discharge_points Outfall at the outfall-end of a too_far pipe are converted to
-    inlets: DEPTH=1 ft, RIMELEV=DEM(m)*3.28084, INVERTELEV=RIMELEV-1;
-    removed from discharge_points + discharge_points_outfall; QA: converted_outfalls)
+    discharge_points Outfall at the outfall-end of a too_far pipe + orphan outfalls
+    are converted to inlets: DEPTH=3 m (9.84252 ft), RIMELEV=DEM(m)*3.28084,
+    INVERTELEV=RIMELEV-DEPTH; removed from discharge_points + discharge_points_outfall;
+    QA layer: converted_outfalls; use --revert to undo this step at any time)
    conda run -n delft3d_dhydamo python houston/outfalls_to_inlets.py houston/houston_white_oak_bayou --dry-run
    conda run -n delft3d_dhydamo python houston/outfalls_to_inlets.py houston/houston_white_oak_bayou --overwrite
+   # Để hoàn tác bước này:
+   # conda run -n delft3d_dhydamo python houston/outfalls_to_inlets.py houston/houston_white_oak_bayou --revert
 
 8. T-junctions between open_drains / gravity_mains (endpoint of one line on the middle of another)
    (run LAST, after all removals and step 7; --action mark = t_junctions point layer only,
