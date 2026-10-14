@@ -31,10 +31,14 @@ Logic
        INLETMAT   : None
        DigitizedBy: 'auto'
        other cols : None / NaN
-6. Append new rows to layer 'inlets' in Stormdrain.gpkg.
-7. Remove converted points from 'discharge_points' (and mark layer
+6. Normalise existing inlets whose DEPTH is missing, non-numeric, zero or
+   negative.  Positive existing DEPTH values are preserved.  Normalised rows
+   receive DEPTH=3 m; existing RIMELEV takes priority, otherwise INVERTELEV,
+   then DEM, then the explicit fallback RIMELEV=0 ft.
+7. Append new rows and write normalised existing rows to layer 'inlets'.
+8. Remove converted points from 'discharge_points' (and mark layer
    'discharge_points_outfall') unless --keep-dp is given.
-8. Write a QA point layer 'converted_outfalls' (source, pipe_OBJECTID,
+9. Write a QA point layer 'converted_outfalls' (source, pipe_OBJECTID,
    RIMELEV, INVERTELEV, new inlet OBJECTID).
 
 Usage
@@ -123,8 +127,70 @@ def sample_dem(tifs: list[Path], points_gdf: gpd.GeoDataFrame,
     return elevs
 
 
+def invalid_depth_mask(inlets: gpd.GeoDataFrame) -> np.ndarray:
+    """Return True for inlet rows that need normalising to DEPTH_FT.
+
+    A positive existing DEPTH is intentionally left unchanged, even when it is
+    not 3 m.  This protects surveyed/engineered inlets from this remediation
+    step, which only repairs missing or invalid depth records.
+    """
+    depths = pd.to_numeric(inlets["DEPTH"], errors="coerce").to_numpy(dtype=float)
+    return ~np.isfinite(depths) | (depths <= 0)
+
+
+def normalise_invalid_inlets(
+    inlets: gpd.GeoDataFrame,
+    dem_elevations_m: np.ndarray,
+) -> tuple[gpd.GeoDataFrame, dict[str, int]]:
+    """Fill invalid-depth inlet elevations and set their DEPTH to DEPTH_FT.
+
+    For each invalid-depth row, RIMELEV remains authoritative when present;
+    otherwise INVERTELEV is used to derive RIMELEV.  If neither is usable,
+    DEM elevation supplies RIMELEV.  Rows outside DEM coverage receive the
+    explicit, traceable fallback RIMELEV=0 ft and INVERTELEV=-DEPTH_FT.
+    """
+    if len(dem_elevations_m) != len(inlets):
+        raise ValueError("dem_elevations_m must have one value per inlet row")
+
+    updated = inlets.copy()
+    invalid = invalid_depth_mask(updated)
+    report = {
+        "invalid_depth": int(invalid.sum()),
+        "from_rim": 0,
+        "from_invert": 0,
+        "from_dem": 0,
+        "fallback": 0,
+    }
+    if not invalid.any():
+        return updated, report
+
+    rims = pd.to_numeric(updated["RIMELEV"], errors="coerce").to_numpy(dtype=float)
+    inverts = pd.to_numeric(updated["INVERTELEV"], errors="coerce").to_numpy(dtype=float)
+
+    for pos in np.flatnonzero(invalid):
+        rim = rims[pos]
+        invert = inverts[pos]
+        if np.isfinite(rim):
+            report["from_rim"] += 1
+        elif np.isfinite(invert):
+            rim = invert + DEPTH_FT
+            report["from_invert"] += 1
+        elif np.isfinite(dem_elevations_m[pos]):
+            rim = dem_elevations_m[pos] * FT_PER_M
+            report["from_dem"] += 1
+        else:
+            rim = 0.0
+            report["fallback"] += 1
+
+        updated.iloc[pos, updated.columns.get_loc("RIMELEV")] = round(float(rim), 5)
+        updated.iloc[pos, updated.columns.get_loc("INVERTELEV")] = round(float(rim - DEPTH_FT), 5)
+        updated.iloc[pos, updated.columns.get_loc("DEPTH")] = DEPTH_FT
+
+    return updated, report
+
+
 def revert_conversion(gpkg_path: Path):
-    """Undo conversion: remove auto inlets, restore discharge_points, drop converted_outfalls."""
+    """Undo converted outfalls only; existing-inlet normalisation is not restored."""
     import sqlite3
     import pyogrio
 
@@ -207,8 +273,9 @@ def main():
                         help="do NOT remove converted points from discharge_points "
                              "(and discharge_points_outfall)")
     parser.add_argument("--revert", action="store_true",
-                        help="undo step 7b: remove auto inlets, restore discharge_points, "
-                             "and drop converted_outfalls QA layer")
+                        help="undo only the converted-outfall part of step 7b: remove auto "
+                             "inlets, restore discharge_points, and drop converted_outfalls; "
+                             "does not restore normalised existing-inlet attributes")
     parser.add_argument("--dry-run", action="store_true",
                         help="only report what would be done; write nothing")
     args = parser.parse_args()
@@ -234,6 +301,8 @@ def main():
     inlets  = gpd.read_file(gpkg_path, layer="inlets",              engine="pyogrio")
 
     gpkg_crs = str(inlets.crs)
+    invalid_existing = invalid_depth_mask(inlets)
+    print(f"existing inlets with missing/invalid DEPTH: {int(invalid_existing.sum())}")
 
     # ------------------------------------------------------------------
     # 2. Find too-far pipes and match their outfall ends to discharge_points
@@ -244,17 +313,14 @@ def main():
     dp_outfall = dp[dp["DISCHRGTYP"] == "Outfall"].copy().reset_index(drop=True)
     print(f"discharge_points with DISCHRGTYP=Outfall: {len(dp_outfall)}")
 
-    if dp_outfall.empty:
-        sys.exit("error: no Outfall discharge_points found; nothing to convert")
-
-    dp_xy   = shapely.get_coordinates(dp_outfall.geometry.values)
-    dp_tree = cKDTree(dp_xy)
-
-    # Match too-far pipe endpoints -> discharge_points
+    # Match too-far pipe endpoints -> discharge_points.  Empty Outfall layers
+    # remain valid when this run only repairs existing inlets.
     matched_indices: dict[int, str] = {}   # dp_outfall index -> source label
     pipe_to_dp: list[dict] = []
 
-    if len(too_far) > 0:
+    dp_xy = shapely.get_coordinates(dp_outfall.geometry.values) if not dp_outfall.empty else np.empty((0, 2))
+    if not dp_outfall.empty and len(too_far) > 0:
+        dp_tree = cKDTree(dp_xy)
         tf_xy  = shapely.get_coordinates(too_far.geometry.values)
         dists, idxs = dp_tree.query(tf_xy, distance_upper_bound=args.tol)
         for pipe_row, dist, dp_idx in zip(too_far.itertuples(), dists, idxs):
@@ -274,20 +340,24 @@ def main():
     #    within --orphan-dist)
     # ------------------------------------------------------------------
     orphan_count = 0
-    if not args.no_orphans:
-        oc_xy    = shapely.get_coordinates(oc.geometry.values)
-        oc_tree  = cKDTree(oc_xy)
-        # For each dp_outfall, find nearest outfall_connections point
-        oc_dists, _ = oc_tree.query(dp_xy)
-        for i, d in enumerate(oc_dists):
-            if d > args.orphan_dist and i not in matched_indices:
+    if not args.no_orphans and not dp_outfall.empty:
+        if oc.empty:
+            orphan_indices = range(len(dp_outfall))
+        else:
+            oc_xy    = shapely.get_coordinates(oc.geometry.values)
+            oc_tree  = cKDTree(oc_xy)
+            # For each dp_outfall, find nearest outfall_connections point.
+            oc_dists, _ = oc_tree.query(dp_xy)
+            orphan_indices = (i for i, d in enumerate(oc_dists) if d > args.orphan_dist)
+        for i in orphan_indices:
+            if i not in matched_indices:
                 matched_indices[i] = "orphan"
                 orphan_count += 1
         print(f"  Orphan discharge_points_outfall (no pipe within {args.orphan_dist} ft): "
               f"{orphan_count}")
 
-    if not matched_indices:
-        print("Nothing to convert.")
+    if not matched_indices and not invalid_existing.any():
+        print("Nothing to convert or normalise.")
         return
 
     # Build matched GeoDataFrame in stable order
@@ -296,14 +366,25 @@ def main():
     sources       = [matched_indices[i] for i in unique_dp_idx]
 
     print(f"Total discharge_points_outfall to convert: {len(matched_dps)}")
-    print(f"  DEPTH: {DEPTH_M} m = {DEPTH_FT} ft (fixed)")
+    print(f"  Target DEPTH for new/invalid records: {DEPTH_M} m = {DEPTH_FT} ft")
 
     # ------------------------------------------------------------------
     # 4. Sample DEM
     # ------------------------------------------------------------------
     print(f"Sampling DEM from {dem_dir} ...")
-    tifs  = load_dem_tiles(dem_dir)
-    elevs = sample_dem(tifs, matched_dps, gpkg_crs, DEM_CRS)
+    tifs = load_dem_tiles(dem_dir)
+    elevs = (sample_dem(tifs, matched_dps, gpkg_crs, DEM_CRS)
+             if len(matched_dps) else np.empty(0, dtype=float))
+
+    existing_dem_m = np.full(len(inlets), np.nan)
+    if invalid_existing.any():
+        invalid_inlets = inlets.loc[invalid_existing]
+        existing_dem_m[invalid_existing] = sample_dem(
+            tifs, invalid_inlets, gpkg_crs, DEM_CRS
+        )
+    normalised_inlets, normalise_report = normalise_invalid_inlets(
+        inlets, existing_dem_m
+    )
 
     n_no_elev = int(np.sum(np.isnan(elevs)))
     if n_no_elev:
@@ -317,10 +398,17 @@ def main():
     # ------------------------------------------------------------------
     print(f"\nNew inlets to create: {len(matched_dps)}")
     print(f"  too_far-linked: {len(matched_indices) - orphan_count}   orphan: {orphan_count}")
-    print(f"  RIMELEV  (ft): min={np.nanmin(rimelev_ft):.5f}  "
-          f"max={np.nanmax(rimelev_ft):.5f}  mean={np.nanmean(rimelev_ft):.5f}")
-    print(f"  INVERTELEV (ft) = RIMELEV - {DEPTH_FT}")
-    if not args.keep_dp:
+    if len(matched_dps) and np.isfinite(rimelev_ft).any():
+        print(f"  RIMELEV  (ft): min={np.nanmin(rimelev_ft):.5f}  "
+              f"max={np.nanmax(rimelev_ft):.5f}  mean={np.nanmean(rimelev_ft):.5f}")
+        print(f"  INVERTELEV (ft) = RIMELEV - {DEPTH_FT}")
+    print("Existing inlets normalised to DEPTH=3 m: "
+          f"{normalise_report['invalid_depth']} "
+          f"(from RIMELEV={normalise_report['from_rim']}, "
+          f"from INVERTELEV={normalise_report['from_invert']}, "
+          f"from DEM={normalise_report['from_dem']}, "
+          f"fallback={normalise_report['fallback']})")
+    if not args.keep_dp and len(matched_dps):
         print(f"  discharge_points to remove: {len(matched_dps)}")
 
     if args.dry_run:
@@ -334,7 +422,6 @@ def main():
     new_oids = np.arange(max_oid + 1, max_oid + 1 + len(matched_dps))
 
     inlet_cols = [c for c in inlets.columns if c != "geometry"]
-
     new_rows = []
     for dp_row, rim, inv, new_oid in zip(
             matched_dps.itertuples(), rimelev_ft, invertelev_ft, new_oids):
@@ -369,12 +456,13 @@ def main():
     dest_gpkg = dest_dir / GPKG
 
     # ------------------------------------------------------------------
-    # 8. Write updated inlets (append new rows)
+    # 8. Write updated inlets (normalised existing rows + new rows)
     # ------------------------------------------------------------------
-    updated_inlets = pd.concat([inlets, new_inlets_gdf], ignore_index=True)
+    updated_inlets = pd.concat([normalised_inlets, new_inlets_gdf], ignore_index=True)
     updated_inlets = gpd.GeoDataFrame(updated_inlets, geometry="geometry", crs=inlets.crs)
     updated_inlets.to_file(dest_gpkg, layer="inlets", driver="GPKG", engine="pyogrio")
-    print(f"Wrote {dest_gpkg}:inlets ({len(inlets)} -> {len(updated_inlets)} rows)")
+    print(f"Wrote {dest_gpkg}:inlets ({len(inlets)} -> {len(updated_inlets)} rows; "
+          f"normalised {normalise_report['invalid_depth']})")
 
     # ------------------------------------------------------------------
     # 9. Remove converted points from discharge_points (and mark layer)
@@ -391,37 +479,42 @@ def main():
         dp_out_updated.to_file(dest_gpkg, layer="discharge_points_outfall",
                                driver="GPKG", engine="pyogrio")
         print(f"Wrote {dest_gpkg}:discharge_points_outfall -> {len(dp_out_updated)} rows")
+    elif not args.keep_dp:
+        print("No discharge_points changed because no new outfalls were converted.")
 
     # ------------------------------------------------------------------
     # 10. Write QA layer 'converted_outfalls'
     # ------------------------------------------------------------------
-    dp_idx_to_pipes: dict[int, list] = {}
-    for entry in pipe_to_dp:
-        dp_idx_to_pipes.setdefault(entry["dp_idx"], []).append(entry["pipe_OBJECTID"])
+    if len(matched_dps):
+        dp_idx_to_pipes: dict[int, list] = {}
+        for entry in pipe_to_dp:
+            dp_idx_to_pipes.setdefault(entry["dp_idx"], []).append(entry["pipe_OBJECTID"])
 
-    qa_rows = []
-    for i, (dp_row, rim, inv, new_oid, src) in enumerate(zip(
-            matched_dps.itertuples(), rimelev_ft, invertelev_ft, new_oids, sources)):
-        orig_dp_idx = unique_dp_idx[i]
-        qa_rows.append({
-            "inlet_OBJECTID":    int(new_oid),
-            "src_FACILITYID":    dp_row.FACILITYID,
-            "src_dp_OBJECTID":   dp_row.OBJECTID,
-            "source":            src,
-            "pipe_OBJECTIDs":    ",".join(str(int(x))
-                                          for x in dp_idx_to_pipes.get(orig_dp_idx, [])),
-            "RIMELEV":           round(float(rim), 5) if not np.isnan(rim) else None,
-            "INVERTELEV":        round(float(inv), 5) if not np.isnan(inv) else None,
-            "DEPTH":             DEPTH_FT,
-        })
+        qa_rows = []
+        for i, (dp_row, rim, inv, new_oid, src) in enumerate(zip(
+                matched_dps.itertuples(), rimelev_ft, invertelev_ft, new_oids, sources)):
+            orig_dp_idx = unique_dp_idx[i]
+            qa_rows.append({
+                "inlet_OBJECTID":    int(new_oid),
+                "src_FACILITYID":    dp_row.FACILITYID,
+                "src_dp_OBJECTID":   dp_row.OBJECTID,
+                "source":            src,
+                "pipe_OBJECTIDs":    ",".join(str(int(x))
+                                              for x in dp_idx_to_pipes.get(orig_dp_idx, [])),
+                "RIMELEV":           round(float(rim), 5) if not np.isnan(rim) else None,
+                "INVERTELEV":        round(float(inv), 5) if not np.isnan(inv) else None,
+                "DEPTH":             DEPTH_FT,
+            })
 
-    qa_gdf = gpd.GeoDataFrame(
-        qa_rows,
-        geometry=[Point(r.geometry.x, r.geometry.y) for r in matched_dps.itertuples()],
-        crs=inlets.crs,
-    )
-    qa_gdf.to_file(dest_gpkg, layer="converted_outfalls", driver="GPKG", engine="pyogrio")
-    print(f"Wrote {dest_gpkg}:converted_outfalls ({len(qa_gdf)} rows)")
+        qa_gdf = gpd.GeoDataFrame(
+            qa_rows,
+            geometry=[Point(r.geometry.x, r.geometry.y) for r in matched_dps.itertuples()],
+            crs=inlets.crs,
+        )
+        qa_gdf.to_file(dest_gpkg, layer="converted_outfalls", driver="GPKG", engine="pyogrio")
+        print(f"Wrote {dest_gpkg}:converted_outfalls ({len(qa_gdf)} rows)")
+    else:
+        print("No new converted_outfalls QA rows written; retained any existing QA layer.")
 
     print(f"\nDone. Output: {dest_dir}")
 
