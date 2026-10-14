@@ -12,9 +12,10 @@ Houston preprocessing (run from repo root, in order)
 3. Mark features into separate layers of Stormdrain.gpkg (re-run = layers rewritten)
    conda run -n hydrolib_env python houston/mark_stormdrain_features.py houston/houston_white_oak_bayou
 
-4. Remove roadside discharge points and roadside/railroad ditch, rain garden, swale open_drains
-   (run AFTER step 3, it deletes the Railroad Ditch features step 3 marks)
-   conda run -n hydrolib_env python houston/remove_stormdrain_features.py houston/houston_white_oak_bayou --overwrite
+4. Remove roadside discharge points, roadside/railroad ditch open_drains, and Virtual Junction/NULL network_structures
+   (run AFTER step 3, it deletes the Railroad Ditch features step 3 marks;
+    use --layers network_structures to only remove network_structures)
+   conda run -n delft3d_dhydamo python houston/remove_stormdrain_features.py houston/houston_white_oak_bayou --overwrite
 
 5. Remove gravity_mains_crossings with an endpoint on a manhole / inlet / fitting
    (default --tol 0.01 m absorbs the ~mm coordinate noise between pipe ends and nodes; --tol 0 = exact)
