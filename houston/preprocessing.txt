@@ -12,9 +12,10 @@ Houston preprocessing (run from repo root, in order)
 3. Mark features into separate layers of Stormdrain.gpkg (re-run = layers rewritten)
    conda run -n hydrolib_env python houston/mark_stormdrain_features.py houston/houston_white_oak_bayou
 
-4. Remove roadside discharge points and roadside/railroad ditch, rain garden, swale open_drains
-   (run AFTER step 3, it deletes the Railroad Ditch features step 3 marks)
-   conda run -n hydrolib_env python houston/remove_stormdrain_features.py houston/houston_white_oak_bayou --overwrite
+4. Remove roadside discharge points, roadside/railroad ditch open_drains, and Virtual Junction/NULL network_structures
+   (run AFTER step 3, it deletes the Railroad Ditch features step 3 marks;
+    use --layers network_structures to only remove network_structures)
+   conda run -n delft3d_dhydamo python houston/remove_stormdrain_features.py houston/houston_white_oak_bayou --overwrite
 
 5. Remove gravity_mains_crossings with an endpoint on a manhole / inlet / fitting
    (default --tol 0.01 m absorbs the ~mm coordinate noise between pipe ends and nodes; --tol 0 = exact)
@@ -37,6 +38,22 @@ Optional: remove source-layer features that match a mask layer
     Large --max-dist creates long artificial pipes: at 110 m, 87 extensions would cross other lines)
    conda run -n hydrolib_env python houston/connect_outfalls_to_channels.py houston/houston_white_oak_bayou --dry-run
    conda run -n hydrolib_env python houston/connect_outfalls_to_channels.py houston/houston_white_oak_bayou --network-outlets --overwrite
+
+7b. Convert too-far outfall discharge_points to inlets & normalise inlets/manholes
+   (run AFTER step 7 --overwrite; reads outfall_connections QA layer;
+    discharge_points Outfall at the outfall-end of a too_far pipe + orphan outfalls
+    are converted to inlets: DEPTH=3 m (9.84252 ft), RIMELEV=DEM(m)*3.28084,
+    INVERTELEV=RIMELEV-DEPTH; removed from discharge_points + discharge_points_outfall;
+    in the same run, existing inlets and manholes with DEPTH NULL/non-numeric/<=0 are repaired
+    to DEPTH=3 m. Positive existing DEPTH values are kept unchanged. For a repaired
+    node, the script uses existing RIMELEV (>0) first, then INVERTELEV (>0), then DEM, then
+    the explicit fallback RIMELEV=0 ft / INVERTELEV=-9.84252 ft;
+    QA layer: converted_outfalls; --revert undoes converted outfalls only and does
+    not restore the normalised attributes of pre-existing inlets/manholes)
+   conda run -n delft3d_dhydamo python houston/outfalls_to_inlets.py houston/houston_white_oak_bayou --dry-run
+   conda run -n delft3d_dhydamo python houston/outfalls_to_inlets.py houston/houston_white_oak_bayou --overwrite
+   # Để hoàn tác bước này:
+   # conda run -n delft3d_dhydamo python houston/outfalls_to_inlets.py houston/houston_white_oak_bayou --revert
 
 8. T-junctions between open_drains / gravity_mains (endpoint of one line on the middle of another)
    (run LAST, after all removals and step 7; --action mark (DEFAULT) = t_junctions point layer only, NOTHING is cut,

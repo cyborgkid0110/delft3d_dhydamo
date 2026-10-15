@@ -29,14 +29,16 @@ import shutil
 import sys
 from pathlib import Path
 
+import pandas as pd
 import geopandas as gpd
 
 GPKG = Path("Stormdrain.gpkg")
 
-# layer -> (attribute column, values to remove)
+# layer -> (attribute column, values to remove; empty string/None matches NULL)
 REMOVALS = {
     "discharge_points": ("DISCHRGTYP", ["Roadside Discharge Point"]),
     "open_drains": ("LINETYPE", ["Roadside Ditch", "Railroad Ditch", "Rain Garden", "Swale"]),
+    "network_structures": ("STRUCTTYPE", ["Virtual Junction", ""]),
 }
 
 
@@ -45,6 +47,8 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("dataset_dir", type=Path,
                         help="cropped dataset folder (contains Stormdrain.gpkg)")
+    parser.add_argument("--layers", nargs="*", default=None,
+                        help="only process these layers (default: all layers in REMOVALS)")
     parser.add_argument("--dest", type=Path, default=None,
                         help="where to write the cleaned copy (default: '<dataset_dir>_cleaned')")
     parser.add_argument("--overwrite", action="store_true",
@@ -58,13 +62,32 @@ def main():
     if not gpkg_path.exists():
         sys.exit(f"error: {gpkg_path} not found")
 
+    layers_to_run = args.layers if args.layers else list(REMOVALS.keys())
+    for l in layers_to_run:
+        if l not in REMOVALS:
+            sys.exit(f"error: unknown layer '{l}'. Available: {list(REMOVALS.keys())}")
+
     cleaned = {}
-    for layer, (col, values) in REMOVALS.items():
+    for layer in layers_to_run:
+        col, values = REMOVALS[layer]
         gdf = gpd.read_file(gpkg_path, layer=layer, engine="pyogrio")
-        drop = gdf[col].isin(values)
-        counts = gdf.loc[drop, col].value_counts()
+
+        has_null = any(v is None or v == "" for v in values)
+        non_null_values = [v for v in values if v is not None and v != ""]
+        drop = pd.Series(False, index=gdf.index)
+        if has_null:
+            drop |= gdf[col].isna() | (gdf[col].astype("string").str.strip() == "")
+        if non_null_values:
+            drop |= gdf[col].isin(non_null_values)
+
+        counts = gdf.loc[drop, col].fillna("<NULL>").replace("", "<NULL>").value_counts()
+        val_strs = [
+            f"{'<NULL>' if (v is None or v == '') else v}="
+            f"{counts.get('<NULL>' if (v is None or v == '') else v, 0)}"
+            for v in values
+        ]
         print(f"{layer}: removing {drop.sum()} of {len(gdf)} "
-              f"({', '.join(f'{v}={counts.get(v, 0)}' for v in values)}) "
+              f"({', '.join(val_strs)}) "
               f"-> {len(gdf) - drop.sum()} remaining")
         cleaned[layer] = gdf[~drop]
 
