@@ -73,7 +73,7 @@ import shapely
 import shutil
 
 GPKG         = Path("Stormdrain.gpkg")
-DEM_DIR      = Path("dem1m")
+DEM_DIR      = Path("../raw/dem1m")
 FT_PER_M     = 3.28084          # DEM is in metres; gpkg elevations are in feet
 DEPTH_M      = 3.0              # depth in metres for converted inlets
 DEPTH_FT     = round(DEPTH_M * FT_PER_M, 5)   # = 9.84252 ft

@@ -38,7 +38,10 @@ Per target, in this order (P = outfall end, d = distance P -> nearest channel)
                   channel vertex, the vertex is used.
     extend_crosses  the extension would cross another pipe / open_drain (no
                   node there, so it would look like a junction but not be one)
-                  -> left alone. --allow-crossing extends anyway.
+                  -> left alone. Lines that end at the connection point are
+                  not counted (they join the channel at the same node, e.g.
+                  the culvert carrying the channel under a road).
+                  --allow-crossing extends anyway.
     too_far       d > --max-dist -> left alone
 
 Whenever the connection point is not a channel endpoint, the channel is split
@@ -56,10 +59,14 @@ Network outlets (--network-outlets, off by default)
 Some pipe networks end near a channel without any of the triggers above (no
 Outfall pipe, no discharge point; their last pipe is e.g. a Collector or
 Culvert), so they are never connected. With this option, after the targets
-are processed, every pipe network (lines sharing endpoints) that still
-reaches no channel gets ONE more target, trigger 'network_outlet': the pipe
-whose digitised END is a dead end (no other line ends there) nearest to a
-channel, if within --max-dist. It goes through the same steps as above.
+are processed, every pipe network (lines sharing endpoints) that touches no
+channel and has no outfall of its own (all its targets, if any, are
+not_outfall) gets ONE more target, trigger 'network_outlet': the pipe whose
+digitised END is a bare dead end -- no other line ends there, and it is not
+on a manhole, inlet or fitting (those are junctions, network starts or
+interconnects to other systems, not outlets) -- nearest to a channel, if
+within --outlet-max-dist (default 20 m, independent of --max-dist). It goes
+through the same steps as above.
 
 A point layer `outfall_connections` (one row per target pipe, with status,
 method distances and the connection point; skipped rows sit on P) is written
@@ -100,8 +107,6 @@ PIPES, DRAINS = "gravity_mains", "open_drains"
 CHANNEL_TYPES = ["Offroad Channel - Manmade", "Offroad Channel - Natural"]
 MARK_LAYER = "outfall_connections"
 KEY = "OBJECTID"
-# statuses after which the outfall end lies on a channel
-CONNECTED = {"connected", "trim_vertex", "trim_split", "snap_vertex", "extend", "shared"}
 
 
 def main():
@@ -123,6 +128,9 @@ def main():
                         help="also connect pipe networks that reach no channel after the "
                              "targets are processed, at their dead-end outlet nearest to a "
                              "channel (see 'Network outlets' above)")
+    parser.add_argument("--outlet-max-dist", type=float, default=20.0,
+                        help="max distance from a network outlet to a channel "
+                             "(default: 20.0; --max-dist applies to the trigger targets)")
     parser.add_argument("--dest", type=Path, default=None,
                         help="where to write the copy (default: '<dataset_dir>_cleaned')")
     parser.add_argument("--overwrite", action="store_true",
@@ -141,6 +149,8 @@ def main():
               for layer in (PIPES, DRAINS)}
     dpts = gpd.read_file(gpkg_path, layer="discharge_points", engine="pyogrio")
     fits = gpd.read_file(gpkg_path, layer="fittings", engine="pyogrio")
+    mhs = gpd.read_file(gpkg_path, layer="manholes", engine="pyogrio")
+    inls = gpd.read_file(gpkg_path, layer="inlets", engine="pyogrio")
 
     # pool of single-part lines from both layers
     pool = [(layer, pos, fid, as_single(g))
@@ -220,6 +230,10 @@ def main():
         """Line ends (owner, which) within tol of xy, from the original endpoints."""
         out = [(e_owner[k], e_which[k]) for k in e_tree.query_ball_point(xy, tol)]
         return [o for o in out if o[0] != exclude]
+
+    def ends_near(h, xy):
+        """Line h (original geometry) has an endpoint within tol of xy."""
+        return min(np.hypot(*(starts[h] - xy)), np.hypot(*(ends[h] - xy))) <= tol
 
     def move_ends(xy, new_xy):
         for owner, which in ends_at(xy):
@@ -316,9 +330,14 @@ def main():
             foot = nearest_points(Point(P), geoms[c])[1].coords[0]
             dfv, FV, fvc = nearest_vertex(foot)
             if not args.allow_crossing:
-                seg = LineString([P, FV if dfv <= tol else foot])
+                target = FV if dfv <= tol else foot
+                seg = LineString([P, target])
                 inner = substring(seg, tol, seg.length - tol)
-                if seg.length > 2 * tol and any(h != i for h in all_tree.query(inner, predicate="intersects")):
+                # a line ending at the target joins the channel at that same node
+                # (e.g. the culvert carrying the channel under a road): crossing
+                # it creates no false junction
+                if seg.length > 2 * tol and any(h != i and not ends_near(h, target)
+                                                for h in all_tree.query(inner, predicate="intersects")):
                     rec.update(status="extend_crosses", channel=c)
                     return
             Q = on_channel(fvc, FV) if dfv <= tol else on_channel(c, foot)
@@ -353,19 +372,25 @@ def main():
 
     if args.network_outlets:
         # pipe networks (lines sharing endpoints, on the original geometry) that
-        # still reach no channel: connect the dead-end digitised END nearest to
-        # a channel, one per network
+        # touch no channel and have no outfall of their own: connect the bare
+        # dead-end digitised END nearest to a channel, one per network
         pairs = e_tree.query_pairs(tol, output_type="ndarray")
         _, comp = connected_components(
             coo_matrix((np.ones(len(pairs)), (e_owner[pairs[:, 0]], e_owner[pairs[:, 1]])),
                        shape=(n, n)), directed=False)
-        reached = set(comp[ch_idx]) | {comp[r["pool_i"]] for r in rows if r["status"] in CONNECTED}
+        # a target that is not a pass-through means the network's outfall is
+        # known (connected, or left alone as too_far / extend_crosses / ...)
+        excluded = set(comp[ch_idx]) | {comp[r["pool_i"]] for r in rows if r["status"] != "not_outfall"}
+        node_tree = cKDTree(np.vstack([shapely.get_coordinates(g.geometry.values)
+                                       for g in (mhs, inls, fits)]))
         best = {}
         for i in pipe_idx:
-            if comp[i] in reached or ends_at(ends[i], exclude=i):
+            if comp[i] in excluded or ends_at(ends[i], exclude=i):
+                continue
+            if node_tree.query(ends[i])[0] <= tol:     # manhole / inlet / fitting: not an outlet
                 continue
             d = chan_dist(ends[i])[1]
-            if d <= args.max_dist and d < best.get(comp[i], (np.inf, None))[0]:
+            if d <= args.outlet_max_dist and d < best.get(comp[i], (np.inf, None))[0]:
                 best[comp[i]] = (d, i)
         for _, i in sorted(best.values()):
             process(i, "end", "network_outlet")

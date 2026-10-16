@@ -36,8 +36,8 @@ GPKG = Path("Stormdrain.gpkg")
 
 # layer -> (attribute column, values to remove; empty string/None matches NULL)
 REMOVALS = {
-    "discharge_points": ("DISCHRGTYP", ["Roadside Discharge Point"]),
-    "open_drains": ("LINETYPE", ["Roadside Ditch", "Railroad Ditch", "Rain Garden", "Swale"]),
+    # "discharge_points": ("DISCHRGTYP", ["Roadside Discharge Point"]),
+    # "open_drains": ("LINETYPE", ["Roadside Ditch", "Railroad Ditch", "Rain Garden", "Swale"]),
     "network_structures": ("STRUCTTYPE", ["Virtual Junction", ""]),
 }
 

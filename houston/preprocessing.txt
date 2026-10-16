@@ -63,11 +63,48 @@ Optional: remove source-layer features that match a mask layer
    conda run -n hydrolib_env python houston/fix_t_junctions.py houston/houston_white_oak_bayou --snap-dist 0.5
    conda run -n hydrolib_env python houston/fix_t_junctions.py houston/houston_white_oak_bayou --action both --snap-dist 0.5 --overwrite
 
+9. Remove standalone manholes / inlets / fittings / discharge_points that touch no open_drains / gravity_mains
+   (run AFTER steps 7, 7b and 8; connected = within --tol 0.01 m of a branch ANYWHERE along it, not just its ends --
+    many inlets / discharge points sit mid-pipe or mid-channel; --ends-only for the strict endpoint test;
+    discharge_points_outfall is cleaned by OBJECTID too; removed nodes -> QA layer standalone_nodes)
+   conda run -n hydrolib_env python houston/remove_standalone_nodes.py houston/houston_white_oak_bayou --dry-run
+   conda run -n hydrolib_env python houston/remove_standalone_nodes.py houston/houston_white_oak_bayou --overwrite
+
+10. Fill NULL/empty/0 attributes of gravity_mains / open_drains (only those cells; --keep-zero leaves 0 values alone)
+   (OBJECTID: NULL + duplicates (split pieces) renumbered, first fid keeps its id -> run AFTER steps 7/8;
+    gravity_mains: UPELEV/DOWNELEV = INVERTELEV of inlet/manhole on start/end point (--tol 0.01 m),
+    else lowest known elevation of the connected pipe ends at that point, else INVERTELEV of an
+    inlet/manhole along the pipe, else the bed (DEM) of the open_drain the end lies on, else the
+    pipe's own other end (level pipe); HEIGHT = WIDTH for BOX,
+    discharge_points FLOWELEV = bed (DEM) of nearest open_drains + DEPTH/3 (after channels are filled),
+    PIPETYPE=Collector, MAINSHAPE=RND, WIDTH=6.56 ft (2 m), MATERIAL=RCP;
+    open_drains: WIDTH/BANKWIDTH (ft) from hcfcd_contours crossings on transects every 25 m,
+    DEPTH = DEM at bank crossings - DEM bed; BANKWIDTH<WIDTH -> both refilled from the contours;
+    rest (no contour result) -> WIDTH 4 m / BANKWIDTH 10 m (in ft), DEPTH from DEM (else 1.5 m);
+    ends with a NULL/empty/0 check of all fields read back from the written gpkg;
+    BED/SIDEMATERIAL = EAR/EAR (Natural), EAR/CP (Manmade);
+    QA layer channel_transects)
+   conda run -n hydrolib_env python houston/fill_null_attributes.py houston/houston_white_oak_bayou_v4_cleaned --dry-run
+   conda run -n hydrolib_env python houston/fill_null_attributes.py houston/houston_white_oak_bayou_v4_cleaned --overwrite
+
 Check (run AFTER steps 7 and 8, they rewrite the layers): connectivity from a reference branch
    (DFS over gravity_mains + open_drains sharing an endpoint; mark layer connected_network, rewritten each run;
     --t-junctions also follows endpoint-on-interior contacts; near misses up to --gap-dist 1 m are printed;
     raise --tol to bridge real gaps. Prefer --ref-objectid: fids are renumbered by every rewrite)
    conda run -n hydrolib_env python houston/check_connectivity.py houston/houston_white_oak_bayou --ref-layer open_drains --ref-objectid 197064
+
+Depth level of the drainage tree below a reference branch (for planning subregions)
+   (BFS tree from the reference over gravity_mains + open_drains, shared endpoints within --tol 0.01 m;
+    level = branching level (0 = main stem, +1 per side branch; the stem follows the largest upstream network,
+    same layer preferred), hop_depth = branches from the reference, trib_id = level-1 tributary system,
+    upstream_len; RGB colours in level_rgb / hop_rgb; mark layer branch_depth + QGIS styles 'branch level'
+    (default) / 'hop depth' in layer_styles; PNG map <dir>/branch_depth.png)
+   conda run -n hydrolib_env python houston/branch_depth.py houston/houston_white_oak_bayou_v3_cleaned --ref-layer open_drains --ref-objectid 197064
+   With breaks: --cut LAYER:OBJECTID (repeatable) = branch is reached but not passed; output -> branch_depth_cut.
+   The network has loops, so a single cut is often bypassed: the script then prints the minimum extra
+   --cut set (pipes preferred) that really cuts off what lies beyond. E.g. 58784 alone cuts off nothing;
+   it is bypassed by a sewer trunk (Outfall 167706) and a box culvert (291259):
+   conda run -n hydrolib_env python houston/branch_depth.py houston/houston_white_oak_bayou_v3_cleaned --cut open_drains:58784 --cut gravity_mains:167706 --cut gravity_mains:291259
 
 Notes
 - Fill / remove / split / connect scripts (2, 4, 5, 6, 7, 8 split, mask): without --overwrite they copy the folder to <dir>_cleaned;
@@ -88,6 +125,9 @@ python houston/remove_by_mask.py houston/houston_white_oak_bayou_cleaned open_dr
 python houston/connect_outfalls_to_channels.py houston/houston_white_oak_bayou_cleaned --max-dist 100 --network-outlet --overwrite
 python houston/fix_t_junctions.py houston/houston_white_oak_bayou_cleaned --action both --snap-dist 0.5 --overwrite
 python houston/check_connectivity.py houston/houston_white_oak_bayou_cleaned --ref-layer open_drains --ref-objectid 197064
+
+python houston/remove_stormdrain_features.py houston/houston_white_oak_bayou_v3
+python houston/outfalls_to_inlets.py houston/houston_white_oak_bayou_v3_cleaned --overwrite
 
 create a script to connect outfall to offroad channels.
 
