@@ -1,5 +1,6 @@
 """
-Fill NULL / empty attributes of gravity_mains and open_drains in Stormdrain.gpkg.
+Fill NULL / empty attributes of gravity_mains, open_drains, discharge_points and
+inlets in Stormdrain.gpkg.
 
 Filled attributes (only cells that are NULL, empty / whitespace-only strings or
 numeric 0 in WIDTH/UPELEV/DOWNELEV/DEPTH/BANKWIDTH; --keep-zero leaves 0 alone)
@@ -22,10 +23,9 @@ numeric 0 in WIDTH/UPELEV/DOWNELEV/DEPTH/BANKWIDTH; --keep-zero leaves 0 alone)
                     HEIGHT        = WIDTH for MAINSHAPE BOX (other shapes untouched)
                     PIPETYPE      Collector
                     MAINSHAPE     RND
-                    WIDTH         2 m = 6.56 ft    (78.74 = 2 m in inches, written by an earlier
-                                  version, is replaced too; feet on purpose; note that the
-                                  existing values 15/18/24/36 ... look like inches and the
-                                  HyDAMO converter multiplies WIDTH by 0.0254)
+                    WIDTH         2 m = 78.74 in   (WIDTH/HEIGHT are inches: 15/18/24/36 ...;
+                                  6.56 = 2 m in feet, written by an earlier version, is
+                                  replaced too, also in the HEIGHT of BOX pipes)
                     MATERIAL      RCP
     open_drains     WIDTH         bottom width, ft  } from hcfcd_contours (FloodManagement.gpkg)
                     BANKWIDTH     top width, ft     } and the DEM, see below
@@ -36,6 +36,7 @@ numeric 0 in WIDTH/UPELEV/DOWNELEV/DEPTH/BANKWIDTH; --keep-zero leaves 0 alone)
                                   filled channel sizes; bed = lowest DEM within +-WIDTH/2 (>= 1 m)
                                   across the channel at its point nearest to the discharge point
                                   (mark layer discharge_points_outfall updated by OBJECTID)
+    inlets          INLETTYPE     A
 
 Channel cross-section from contours
 -----------------------------------
@@ -102,23 +103,25 @@ CONTOUR_LAYER = "hcfcd_contours"
 DEM_DIR = Path("../raw/dem1m")       # relative to the dataset folder
 DEM_CRS = "EPSG:26915"               # DEM tiles, metres
 FT_PER_M = 3.28084                   # gpkg elevations / channel sizes are in feet
+IN_PER_M = 39.3701                   # gravity_mains WIDTH / HEIGHT are in inches
 ID_COLUMN = "OBJECTID"
 NODE_LAYERS = ("inlets", "manholes")
 
 PIPE_FILLS = {
     "PIPETYPE": "Collector",
     "MAINSHAPE": "RND",
-    "WIDTH": round(2.0 * FT_PER_M, 2),   # 2 m pipe -> 6.56 ft
+    "WIDTH": round(2.0 * IN_PER_M, 2),   # 2 m pipe -> 78.74 in
     "MATERIAL": "RCP",
 }
+INLET_FILLS = {"INLETTYPE": "A"}
 # open_drains without a usable contour result (or BANKWIDTH < WIDTH)
 DEFAULT_WIDTH_M, DEFAULT_BANKWIDTH_M, DEFAULT_DEPTH_M = 4.0, 10.0, 1.5
 DEFAULT_WIDTH_FT = round(DEFAULT_WIDTH_M * FT_PER_M, 2)          # 13.12
 DEFAULT_BANKWIDTH_FT = round(DEFAULT_BANKWIDTH_M * FT_PER_M, 2)  # 32.81
 DEFAULT_DEPTH_FT = round(DEFAULT_DEPTH_M * FT_PER_M, 2)          # 4.92, if the DEM gives none
 # values written by an earlier version of this script, replaced on a rerun
-# (2 m was first written in inches)
-STALE_PIPE_FILLS = {"WIDTH": [78.74]}
+# (2 m was written in feet; no real pipe is 6.56 in)
+STALE_PIPE_FILLS = {"WIDTH": [6.56], "HEIGHT": [6.56]}
 # LINETYPE -> (BEDMATERIAL, SIDEMATERIAL)
 CHANNEL_MATERIALS = {
     "Offroad Channel - Natural": ("EAR", "EAR"),
@@ -230,7 +233,8 @@ def pipe_updates(pipes, nodes, tol, zero, channels, sizes, dem_dir) -> tuple[dic
 
     # rectangular (BOX) pipes: a missing HEIGHT = WIDTH (square box)
     box = pipes["MAINSHAPE"].astype(str).str.strip().str.upper().eq("BOX")
-    miss = box & missing(pipes["HEIGHT"], zero)
+    miss = box & (missing(pipes["HEIGHT"], zero)
+                  | pd.to_numeric(pipes["HEIGHT"], errors="coerce").isin(STALE_PIPE_FILLS["HEIGHT"]))
     put(miss.to_numpy(), "HEIGHT", width)
     report.append(f"HEIGHT        {miss.sum():6d} of {box.sum()} BOX pipes filled with their WIDTH")
     return upd, report
@@ -610,12 +614,29 @@ def channel_bed(geoms: gpd.GeoSeries, channels, sizes: pd.DataFrame, dem_dir: Pa
             pd.Series(dist, index=index).reindex(geoms.index))
 
 
+# ---------------------------------------------------------------------------
+# inlets
+# ---------------------------------------------------------------------------
+
+def inlet_updates(inlets) -> tuple[dict, list[str]]:
+    """Fixed values for missing INLET_FILLS attributes."""
+    upd: dict[int, dict] = {}
+    report = []
+    for col, value in INLET_FILLS.items():
+        miss = missing(inlets[col])
+        for fid in inlets.loc[miss, "fid"]:
+            upd.setdefault(fid, {})[col] = value
+        report.append(f"{col:<13} {miss.sum():6d} filled with {value!r}")
+    return upd, report
+
+
 CHECK_FIELDS = {
     "gravity_mains": ["OBJECTID", "MATERIAL", "WIDTH", "HEIGHT", "MAINSHAPE", "PIPETYPE",
                       "DOWNELEV", "UPELEV"],
     "open_drains": ["OBJECTID", "LINETYPE", "WIDTH", "DEPTH", "BEDMATERIAL", "SIDEMATERIAL",
                     "BANKWIDTH"],
     "discharge_points": ["FLOWELEV"],
+    "inlets": list(INLET_FILLS),
 }
 
 
@@ -704,6 +725,12 @@ def main():
     dp_upd, dp_rep = discharge_updates(points, channels, sizes, dem_dir, args.zero_as_missing)
     print("\n".join("  " + line for line in dp_rep))
 
+    inlets = gpd.read_file(gpkg, layer="inlets", columns=list(INLET_FILLS), ignore_geometry=True,
+                           fid_as_index=True).rename_axis("fid").reset_index()
+    print(f"\ninlets ({len(inlets)} features)")
+    inlet_upd, inlet_rep = inlet_updates(inlets)
+    print("\n".join("  " + line for line in inlet_rep))
+
     if args.dry_run:
         print("\n--dry-run: nothing written")
         return
@@ -724,6 +751,7 @@ def main():
         n_pipes = write_updates(con, "gravity_mains", pipe_upd)
         n_chan = write_updates(con, "open_drains", chan_upd)
         n_dp = write_updates(con, "discharge_points", dp_upd)
+        n_inlets = write_updates(con, "inlets", inlet_upd)
         # keep the mark layer discharge_points_outfall (same features, matched by OBJECTID) in sync
         if con.execute("SELECT 1 FROM gpkg_contents WHERE table_name = 'discharge_points_outfall'").fetchone():
             oid = points.set_index("fid")[ID_COLUMN]
@@ -734,7 +762,8 @@ def main():
         con.close()
     if qa is not None:
         qa.to_file(dest, layer="channel_transects", driver="GPKG")
-    print(f"\nDone. Updated {dest}: gravity_mains={n_pipes}, open_drains={n_chan}, discharge_points={n_dp} features"
+    print(f"\nDone. Updated {dest}: gravity_mains={n_pipes}, open_drains={n_chan}, discharge_points={n_dp}, "
+          f"inlets={n_inlets} features"
           + ("; QA layer channel_transects" if qa is not None else ""))
     check_missing(dest)
 

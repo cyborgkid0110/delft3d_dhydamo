@@ -77,7 +77,7 @@ Optional: remove source-layer features that match a mask layer
     inlet/manhole along the pipe, else the bed (DEM) of the open_drain the end lies on, else the
     pipe's own other end (level pipe); HEIGHT = WIDTH for BOX,
     discharge_points FLOWELEV = bed (DEM) of nearest open_drains + DEPTH/3 (after channels are filled),
-    PIPETYPE=Collector, MAINSHAPE=RND, WIDTH=6.56 ft (2 m), MATERIAL=RCP;
+    PIPETYPE=Collector, MAINSHAPE=RND, WIDTH=78.74 in (2 m; replaces the 6.56 ft of an earlier run), MATERIAL=RCP;
     open_drains: WIDTH/BANKWIDTH (ft) from hcfcd_contours crossings on transects every 25 m,
     DEPTH = DEM at bank crossings - DEM bed; BANKWIDTH<WIDTH -> both refilled from the contours;
     rest (no contour result) -> WIDTH 4 m / BANKWIDTH 10 m (in ft), DEPTH from DEM (else 1.5 m);
