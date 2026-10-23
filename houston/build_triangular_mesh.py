@@ -5,23 +5,25 @@ Steps
   1. roads    : buffer OSM centrelines by their width -> road polygons. Paired one-way
                 carriageways (divided roads) are merged incl. the median, so the boundary
                 is drawn on the two OUTER edges only. Inside AOI: all classes; outside AOI:
-                tertiary/secondary/primary/trunk/motorway only.
+                tertiary/secondary/primary/trunk/motorway only, up to ROAD_MAX_DIST.
   2. channels : open_drains top-of-bank polygon = envelope of the densely spaced
                 hcfcd_contours along the channel (fallback: centreline buffer WIDTH/2).
   3. partition: region is cut by road edges, bank lines, AOI boundary and distance bands
                 around AOI -> faces with class road/block/channel and target size h.
   4. mesh     : every face boundary is resampled once (shared edges get identical nodes,
-                spacing = min h of both sides), each face is triangulated with
-                meshkernel, channel faces are skipped, all pieces merged into one mesh.
+                spacing = min h of both sides); one constrained quality triangulation
+                (Triangle) of all road/block faces with the face boundaries as fixed
+                segments, channel faces as holes and a max cell area per face from h.
 
 Usage
   python build_triangular_mesh.py [--data DIR] [--bbox xmin ymin xmax ymax] [--stage roads|channels|partition|mesh]
+                                  [--reuse] [--from-faces]
 Outputs (in DIR): mesh_boundaries.gpkg (roads/channels/faces layers), mesh2d_net.nc
+Requires the `triangle` package (pip install triangle).
 """
 import argparse, time
 import numpy as np, pandas as pd, geopandas as gpd, shapely
 from shapely.geometry import Polygon, LineString, box
-from shapely.ops import split
 
 CRS = 32140
 LANE = 3.6
@@ -32,8 +34,15 @@ GROUP = {h: "fwy" if h in ("motorway", "trunk") else "art" if h in MAJOR else "l
 MAXGAP = {"fwy": 50.0, "art": 35.0, "loc": 25.0}   # max centreline distance of paired carriageways [m]
 
 H_AOI = {"road": 4.0, "block": 8.0}
-BANDS = [500.0, 1500.0, 3000.0]                     # distance from AOI [m] -> band 0..3
-H_OUT = {"road": [6.0, 8.0, 10.0, 12.0], "block": [16.0, 16.0, 20.0, 24.0]}
+BANDS = [500.0, 1500.0, 3000.0, 5000.0, 8000.0, 12000.0]   # distance from AOI [m] -> band 0..6
+H_OUT = {"road": [6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0],
+         "block": [16.0, 20.0, 24.0, 32.0, 48.0, 64.0, 96.0]}
+ROAD_MAX_DIST = 5000.0   # roads further than this from the AOI are not resolved (meshed as block)
+H_BANK = 32.0            # max spacing on channel banks (keeps bank cells within the 1D2D link length)
+MIN_ANGLE = 28.0         # Triangle quality bound [deg]
+AREA_FACTOR = 0.8        # max triangle area = AREA_FACTOR * h^2 (equilateral with edge h: 0.433 h^2)
+PSLG_SNAP = 0.25         # boundary vertices / vertex-segment gaps closer than this are merged [m]
+SEED_MIN_RADIUS = 0.05   # PSLG cells thinner than this (inscribed radius) are not seeded [m]
 
 CONTOUR_R = 3.0          # contours closer than 2*R (slope > ~10%) merge into one bank band
 FT = 0.3048
@@ -230,6 +239,7 @@ def resample(line, h, corner_deg=30.0):
 
 def build_partition(reg, aoi, roads, chan):
     zl = zones(reg, aoi)
+    roads = roads.intersection(aoi.buffer(ROAD_MAX_DIST, quad_segs=8))
     lines = [reg.boundary, roads.boundary, chan.boundary] + [zp.boundary for _, zp in zl]
     faces = polygonize(lines)
     f = classify(faces, roads, chan, zl)
@@ -242,9 +252,12 @@ def build_partition(reg, aoi, roads, chan):
     hmin = np.full(len(edges), np.inf)
     ei, fi = tree.query(edges, predicate="intersects")
     hf = f.h.fillna(np.inf).values
+    bank = np.zeros(len(edges), dtype=bool)
     for e, j in zip(ei, fi):
         if f.geometry[j].boundary.intersection(edges[e]).length > 0.5 * edges[e].length:
             hmin[e] = min(hmin[e], hf[j])
+            bank[e] |= f.cls[j] == "channel"
+    hmin[bank] = np.minimum(hmin[bank], H_BANK)
     hmin[~np.isfinite(hmin)] = 8.0   # edge only bounds channel faces: spacing irrelevant
     dense = np.array([resample(e, h) for e, h in zip(edges, hmin)])
     # chords that cut a corner can cross a neighbouring edge: keep original vertices there
@@ -274,45 +287,6 @@ def build_partition(reg, aoi, roads, chan):
 
 
 # ----------------------------------------------------------------------------- mesh
-def split_holes(p):
-    """Cut a polygon with holes into hole-free pieces (vertical cut through each hole)."""
-    todo, done = [p], []
-    while todo:
-        q = todo.pop()
-        if not q.interiors:
-            done.append(q); continue
-        c = Polygon(q.interiors[0]).representative_point()
-        y0, y1 = q.bounds[1] - 1, q.bounds[3] + 1
-        todo += [g for g in split(q, LineString([(c.x, y0), (c.x, y1)])).geoms if g.area > 0]
-    return done
-
-
-MAX_CELLS = 15000   # meshkernel's polygon triangulator runs out of index space on big polygons
-
-
-def pieces(poly, h):
-    """Hole-free pieces of a face, tiled so each holds at most ~MAX_CELLS triangles.
-    Cut lines are noded and densified once, so neighbouring pieces share their nodes."""
-    out = []
-    for p in split_holes(poly):
-        if p.area / (0.433 * h * h) <= MAX_CELLS:
-            out.append(p); continue
-        t = np.sqrt(MAX_CELLS * 0.433) * h * 0.7
-        x0, y0, x1, y1 = p.bounds
-        for x in np.arange(x0, x1, t):
-            for y in np.arange(y0, y1, t):
-                q = p.intersection(box(x, y, x + t, y + t))
-                for g in shapely.get_parts(q):
-                    if g.geom_type == "Polygon" and g.area > 1e-3:
-                        out += split_holes(g)
-    if len(out) == 1:
-        return out
-    lines = shapely.get_parts(shapely.union_all([q.boundary for q in out]))
-    dense = [LineString(densify_line(np.asarray(l.coords), h * 1.3)) for l in lines]
-    res = [q for q in shapely.get_parts(shapely.polygonize(dense)) if shapely.contains(poly, q.point_on_surface())]
-    return [q for r in res for q in split_holes(r)]
-
-
 def densify_line(c, h):
     out = []
     for a, b in zip(c[:-1], c[1:]):
@@ -322,227 +296,167 @@ def densify_line(c, h):
     return np.array(out)
 
 
-def densify_ring(ring, h):
-    c = np.asarray(ring.coords); out = []
-    for a, b in zip(c[:-1], c[1:]):
-        n = max(1, int(np.ceil(np.hypot(*(b - a)) / h - 0.2)))
-        out += [a + (b - a) * t for t in np.arange(n) / n]
-    return np.array(out)
+def _merge_vertices(xy, seg, tol):
+    """Merge vertices closer than tol (KD-tree clusters, not grid rounding); drop
+    collapsed and duplicate segments."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+    pairs = cKDTree(xy).query_pairs(tol, output_type="ndarray")
+    g = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(len(xy), len(xy)))
+    nv, lab = connected_components(g, directed=False)
+    cnt = np.bincount(lab)
+    verts = np.c_[np.bincount(lab, weights=xy[:, 0]), np.bincount(lab, weights=xy[:, 1])] / cnt[:, None]
+    seg = np.sort(lab[seg], axis=1)
+    seg = np.unique(seg[seg[:, 0] != seg[:, 1]], axis=0)
+    used = np.unique(seg)
+    remap = -np.ones(nv, dtype=np.int64); remap[used] = np.arange(used.size)
+    return verts[used], remap[seg], len(pairs)
 
 
-def mesh_face(mk, poly, h):
-    """Triangulate one hole-free polygon -> (xy nodes, triangles as node index triples)."""
-    try:
-        ring = shapely.remove_repeated_points(poly, 0.01).exterior
-    except shapely.errors.GEOSException:      # collapsed sliver piece
-        return None
-    xy = densify_ring(ring, h * 1.3)          # only cut lines get extra nodes
-    if len(xy) < 3:
-        return None
-    hb = np.mean(np.hypot(*np.diff(np.vstack([xy, xy[:1]]), axis=0).T))
-    xy = np.vstack([xy, xy[:1]])
-    sf = 1.5 * (h / hb) ** 2
-    mk.mesh2d_set(mkm.Mesh2d(np.zeros(0), np.zeros(0), np.zeros(0, dtype=np.int32)))
-    try:
-        mk.mesh2d_make_triangular_mesh_from_polygon(mkm.GeometryList(xy[:, 0].copy(), xy[:, 1].copy()), scale_factor=sf)
-    except Exception as ex:
-        log("  meshkernel failed:", ex); return None
-    m = mk.mesh2d_get()
-    if len(m.face_x) == 0:
-        return None
-    npf = m.nodes_per_face
-    cells = np.split(m.face_nodes, np.cumsum(npf)[:-1])
-    # meshkernel triangulates unconstrained and filters on centre only: near sharp notches a
-    # cell can stick out of the face -> keep only cells lying inside (gaps are filled later)
-    ring = [np.column_stack([m.node_x[c], m.node_y[c]]) for c in cells]
-    inside = shapely.contains(shapely.prepare(poly.buffer(1e-2)) or poly.buffer(1e-2),
-                              np.array([Polygon(r) for r in ring], dtype=object))
-    return np.column_stack([m.node_x, m.node_y]), [c for c, ok in zip(cells, inside) if ok]
+def _split_at_near_vertices(V, S, tol):
+    """Split every segment at the vertices lying within tol of its interior, so near-touches
+    become real junctions and overlapping collinear pieces become identical segments."""
+    segs = shapely.linestrings(np.stack([V[S[:, 0]], V[S[:, 1]]], axis=1))
+    pi, si = shapely.STRtree(segs).query(shapely.points(V), predicate="dwithin", distance=tol)
+    keep = (S[si, 0] != pi) & (S[si, 1] != pi)
+    pi, si = pi[keep], si[keep]
+    if not len(pi):
+        return S, 0
+    a, b = V[S[si, 0]], V[S[si, 1]]
+    t = ((V[pi] - a) * (b - a)).sum(1) / ((b - a) ** 2).sum(1)
+    ok = (t > 0) & (t < 1)
+    pi, si, t = pi[ok], si[ok], t[ok]
+    split = np.zeros(len(S), bool); split[si] = True
+    new = [S[~split]]
+    order = np.lexsort((t, si))
+    for s, grp in pd.Series(pi[order]).groupby(si[order]):
+        chain = np.r_[S[s, 0], grp.values, S[s, 1]]
+        new.append(np.c_[chain[:-1], chain[1:]])
+    S = np.vstack(new)
+    S = np.sort(S, axis=1)
+    return np.unique(S[S[:, 0] != S[:, 1]], axis=0), int(split.sum())
 
 
-def fix_hanging(cells, xy, rel_tol=0.01):
-    """Conform T-junctions: a boundary edge a-c of one triangle along which the neighbouring
-    piece has extra nodes a-b1-..-c (cut-line end points) -> fan-split the triangle."""
-    from collections import defaultdict
-    emap = defaultdict(list)
-    for k, c in enumerate(cells):
-        for i in range(len(c)):
-            emap[frozenset((c[i], c[(i + 1) % len(c)]))].append(k)
-    bnb = defaultdict(set)                       # boundary-edge neighbours of each node
-    for e, ks in emap.items():
-        if len(ks) == 1:
-            a, b = tuple(e); bnb[a].add(b); bnb[b].add(a)
-
-    def offline(b, a, c):
-        pa, pb, pc = xy[a], xy[b], xy[c]; v = pc - pa; L = np.hypot(*v)
-        t = np.dot(pb - pa, v) / L ** 2
-        return not (0 < t < 1) or abs(v[0] * (pb - pa)[1] - v[1] * (pb - pa)[0]) / L > rel_tol * L
-
-    def chain(a, c):
-        """Collinear boundary path a -> ... -> c (excluding the direct edge), or None."""
-        path, prev, cur = [a], None, a
-        for _ in range(8):
-            nxt = [n for n in bnb[cur] if n != prev and n != (c if cur == a else -1) and not offline(n, a, c)]
-            if c in bnb[cur] and cur != a:
-                return path + [c]
-            if not nxt:
-                return None
-            nxt.sort(key=lambda n: np.hypot(*(xy[n] - xy[c])))
-            prev, cur = cur, nxt[0]; path.append(cur)
-        return None
-
-    out, nfix = [], 0
-    for k, c in enumerate(cells):
-        if len(c) != 3:
-            out.append(c); continue
-        done = False
-        for i in range(3):
-            a, cc, d = c[i], c[(i + 1) % 3], c[(i + 2) % 3]
-            if len(emap[frozenset((a, cc))]) != 1:
-                continue
-            path = chain(a, cc)
-            if path and len(path) > 2:
-                out += [np.array([p, q, d]) for p, q in zip(path[:-1], path[1:])]
-                nfix += 1; done = True
-                break
-        if not done:
-            out.append(c)
-    log(f"hanging nodes conformed: {nfix} triangles split")
-    return out
+def pslg(f, snap=PSLG_SNAP):
+    """Planar straight-line graph of all face boundaries: vertices, segments (shared edges
+    once), region seeds (road/block faces: attribute = face index + 1, max triangle area
+    from h) and hole points (channel faces). The face boundaries come from separate
+    polygonize/resample steps, so they hold near-duplicate vertices, mm-short segments and
+    overlapping collinear pieces (0 deg input angles, on which Triangle's quality refinement
+    never terminates): vertices closer than `snap` are merged and segments are split at
+    vertices within `snap` of them, until nothing changes."""
+    xy, seg, off = [], [], 0
+    for g in f.geometry:
+        for r in [g.exterior, *g.interiors]:
+            c = np.asarray(r.coords)[:-1, :2]
+            n = len(c)
+            xy.append(c)
+            seg.append(off + np.c_[np.arange(n), (np.arange(n) + 1) % n])
+            off += n
+    verts, seg = np.vstack(xy), np.vstack(seg)
+    for it in range(5):
+        verts, seg, nmerged = _merge_vertices(verts, seg, snap)
+        seg, nsplit = _split_at_near_vertices(verts, seg, snap)
+        log(f"PSLG clean pass {it}: {nmerged} vertex pairs merged, {nsplit} segments split")
+        if not nmerged and not nsplit:
+            break
+    # Seed every area that the segments actually enclose (a face can hold several such
+    # cells, and the cleaning moves boundaries slightly): polygonize the segments, classify
+    # each cell by the face it lies in, and seed it at its maximum-inscribed-circle centre.
+    # Sliver cells (inscribed radius < SEED_MIN_RADIUS) are not seeded: a seed on or next to
+    # a segment can land in the neighbouring cell, and a misplaced hole erases that cell.
+    cells = np.array(shapely.get_parts(shapely.polygonize(
+        shapely.linestrings(np.stack([verts[seg[:, 0]], verts[seg[:, 1]]], axis=1)))))
+    mic = shapely.maximum_inscribed_circle(cells, tolerance=0.01)
+    rad = shapely.length(mic)
+    pos = shapely.get_coordinates(shapely.get_point(mic, 0))
+    ci, fi = shapely.STRtree(f.geometry.values).query(shapely.points(pos), predicate="within")
+    face = -np.ones(len(cells), dtype=np.int64); face[ci] = fi
+    ok = (face >= 0) & (rad >= SEED_MIN_RADIUS)
+    land = ok & (f.cls.values[np.maximum(face, 0)] != "channel")
+    chan = ok & ~land
+    regions = np.c_[pos[land], face[land] + 1, AREA_FACTOR * f.h.values[face[land]] ** 2]
+    holes = pos[chan]
+    log(f"PSLG cells: {len(cells)} ({land.sum()} land, {chan.sum()} channel, "
+        f"{(face < 0).sum()} outside any face, {((face >= 0) & ~ok).sum()} slivers not seeded, "
+        f"sliver area {shapely.area(cells[(face >= 0) & ~ok]).sum():.0f} m2)")
+    return verts, seg, regions, holes
 
 
-def fill_gaps(cells, xy, max_nodes=12, max_area=200.0):
-    """Triangulate small closed loops of boundary edges (gaps left between pieces)."""
-    from collections import defaultdict
-    cnt = defaultdict(int)
-    for c in cells:
-        for i in range(len(c)):
-            cnt[(min(c[i], c[(i + 1) % len(c)]), max(c[i], c[(i + 1) % len(c)]))] += 1
-    nb = defaultdict(list)
-    for (a, b), k in cnt.items():
-        if k == 1:
-            nb[a].append(b); nb[b].append(a)
-    seen, new = set(), []
-    for start in list(nb):
-        if start in seen or len(nb[start]) != 2:
-            continue
-        loop, prev, cur = [start], None, start
-        while len(loop) <= max_nodes:
-            nxt = [n for n in nb[cur] if n != prev]
-            if len(nb[cur]) != 2 or not nxt:
-                loop = None; break
-            prev, cur = cur, nxt[0]
-            if cur == start:
-                break
-            loop.append(cur)
-        else:
-            loop = None
-        if not loop or cur != start:
-            continue
-        seen.update(loop)
-        poly = Polygon(xy[loop])
-        if not poly.is_valid or poly.area > max_area:
-            continue
-        tri = shapely.get_parts(shapely.constrained_delaunay_triangles(poly))
-        key = {tuple(np.round(xy[n], 6)): n for n in loop}
-        for t in tri:
-            ids = [key.get(tuple(np.round(p, 6))) for p in np.asarray(t.exterior.coords)[:3]]
-            if None not in ids and t.area > 1e-6:
-                new.append(np.array(ids))
-    log(f"gaps filled: {len(new)} triangles")
-    return cells + new
+def mesh_quality(x, y, tris):
+    """Interior angles (deg) and signed areas of triangles."""
+    p = np.stack([np.c_[x[tris[:, k]], y[tris[:, k]]] for k in range(3)], axis=1)
+    area = 0.5 * ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+                  - (p[:, 2, 0] - p[:, 0, 0]) * (p[:, 1, 1] - p[:, 0, 1]))
+    ang = []
+    for k in range(3):
+        a, b, c = p[:, k], p[:, (k + 1) % 3], p[:, (k + 2) % 3]
+        v1, v2 = b - a, c - a
+        cos = (v1 * v2).sum(1) / np.hypot(*v1.T) / np.hypot(*v2.T)
+        ang.append(np.degrees(np.arccos(np.clip(cos, -1, 1))))
+    return np.c_[tuple(ang)], area
 
 
-def flat_face_merges(m, rel=0.01):
-    """{middle node: nearest end node} for (near) zero-area triangles of a meshkernel Mesh2d."""
-    npf = m.nodes_per_face
-    fn = np.split(m.face_nodes, np.cumsum(npf)[:-1])
-    out = {}
-    for c in fn:
-        if len(c) != 3:
-            continue
-        p = np.column_stack([m.node_x[c], m.node_y[c]])
-        l = np.hypot(*(np.roll(p, -1, axis=0) - p).T)
-        area = 0.5 * abs((p[1, 0] - p[0, 0]) * (p[2, 1] - p[0, 1]) - (p[2, 0] - p[0, 0]) * (p[1, 1] - p[0, 1]))
-        if area >= rel * l.max() ** 2 / 2:
-            continue
-        i = int(np.argmax(l)); a, b, mid = c[i], c[(i + 1) % 3], c[(i + 2) % 3]
-        da, db = np.hypot(*(p[(i + 2) % 3] - p[i])), np.hypot(*(p[(i + 2) % 3] - p[(i + 1) % 3]))
-        if mid not in out and a not in out and b not in out:
-            out[mid] = a if da < db else b
-    return out
+def check_mesh(m):
+    """Topology checks on a meshkernel Mesh2d; returns a dict of defect counts."""
+    fn, npf, nn = m.face_nodes, m.nodes_per_face, m.node_x.size
+    start = np.r_[0, np.cumsum(npf)[:-1]]
+    nxt = np.arange(fn.size) + 1; nxt[np.cumsum(npf) - 1] = start
+    fe = np.sort(np.c_[fn, fn[nxt]], axis=1).astype(np.int64)
+    u, c = np.unique(fe[:, 0] * nn + fe[:, 1], return_counts=True)
+    b = u[c == 1]
+    bdeg = np.bincount(np.r_[b // nn, b % nn], minlength=nn)
+    fid = np.repeat(np.arange(npf.size), npf)
+    x, y = m.node_x, m.node_y
+    area = 0.5 * np.bincount(fid, weights=x[fn] * y[fn[nxt]] - y[fn] * x[fn[nxt]], minlength=npf.size)
+    en = np.sort(m.edge_nodes.reshape(-1, 2), axis=1).astype(np.int64)
+    return {"non_manifold_edges": int((c > 2).sum()),
+            "edges_without_face": int((~np.isin(en[:, 0] * nn + en[:, 1], u)).sum()),
+            "pinch_nodes": int((bdeg > 2).sum()),
+            "inverted_cells": int((area <= 0).sum()),
+            "non_triangles": int((npf != 3).sum())}
 
 
 def build_mesh(f, out_nc):
-    global mkm
-    import meshkernel as mkm
-    mk = mkm.MeshKernel()
-    keyx, tris = {}, []
-    nodes = []
-    f = f[f.cls != "channel"]
-    t = time.time()
-    for n, (poly, h) in enumerate(zip(f.geometry, f.h)):
-        for piece in pieces(poly, h):
-            res = mesh_face(mk, piece, h)
-            if res is None:
-                continue
-            xy, tri = res
-            key = np.round(xy * 100).astype(np.int64)          # merge on 1 cm
-            gid = np.empty(len(xy), dtype=np.int64)
-            for k, (kx, ky) in enumerate(key):
-                g = keyx.get((kx, ky))
-                if g is None:
-                    g = keyx[(kx, ky)] = len(nodes); nodes.append(xy[k])
-                gid[k] = g
-            tris += [gid[c] for c in tri if len(set(gid[c])) == len(c)]   # drop cells collapsed by the 1 cm merge
-        if n % 500 == 0:
-            log(f"  meshed {n}/{len(f)} faces, {len(tris)} cells, {time.time() - t:.0f}s")
-    xy = np.array(nodes)
-    tris = fill_gaps(fix_hanging(tris, xy), xy)
-    npf = np.array([len(c) for c in tris])
-    e = np.sort(np.vstack([np.column_stack([c, np.roll(c, -1)]) for c in tris]), axis=1)
-    e, cnt = np.unique(e, axis=0, return_counts=True)
-    log(f"mesh: {len(xy)} nodes, {len(e)} edges, {len(tris)} cells "
-        f"({(npf == 3).sum()} triangles, {(npf > 3).sum()} with >3 nodes); non-manifold edges: {(cnt > 2).sum()}")
-    bad = e[cnt > 2]
-    if len(bad):
-        mid = (xy[bad[:, 0]] + xy[bad[:, 1]]) / 2
-        log("  non-manifold edges at:", "; ".join(f"{px:.1f},{py:.1f}" for px, py in mid[:10]))
-    cx = [xy[c, 0] for c in tris]; cy = [xy[c, 1] for c in tris]
-    area = np.array([0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) for x, y in zip(cx, cy)])
-    el = np.hypot(*(xy[e[:, 0]] - xy[e[:, 1]]).T)
-    log(f"coverage: cells {area.sum() / 1e6:.4f} km2 vs faces {f.area.sum() / 1e6:.4f} km2; "
-        f"edge length p5/p50/p95 = {np.percentile(el, 5):.1f}/{np.percentile(el, 50):.1f}/{np.percentile(el, 95):.1f} m")
-    tri = tris
-    from hydrolib.core.dflowfm.net.models import Network
-    net = Network()
-    mk2 = net._mesh2d.meshkernel
-    nx, ny, en = xy[:, 0].copy(), xy[:, 1].copy(), e.astype(np.int32)
-    for it in range(4):
-        net._mesh2d._set_mesh2d(nx, ny, en.ravel())
-        mk2.mesh2d_delete_small_flow_edges_and_small_triangles(
-            small_flow_edges_length_threshold=0.1, min_fractional_area_triangles=0.01)
-        m = mk2.mesh2d_get()
-        nx, ny = m.node_x.copy(), m.node_y.copy()
-        en = m.edge_nodes.reshape(-1, 2).astype(np.int32)
-        merge = flat_face_merges(m)
-        log(f"cleanup pass {it}: {len(m.node_x)} nodes, {len(m.face_x)} cells "
-            f"(>3 nodes: {(m.nodes_per_face > 3).sum()}), flat cells: {len(merge)}")
-        if not merge:
-            break
-        # merge the middle node of each flat cell into its nearest end node, rebuild edges
-        tgt = np.arange(len(nx))
-        for a, b in merge.items():
-            tgt[a] = b
-        for _ in range(5):
-            tgt = tgt[tgt]
-        en = np.sort(tgt[en], axis=1); en = np.unique(en[en[:, 0] != en[:, 1]], axis=0)
-        used = np.unique(en); remap = -np.ones(len(nx), dtype=np.int32); remap[used] = np.arange(len(used))
-        nx, ny, en = nx[used], ny[used], remap[en].astype(np.int32)
+    """One constrained quality triangulation (Triangle) of all road/block faces: every face
+    boundary is a fixed segment, so neighbouring faces share nodes by construction; channel
+    faces are holes; max triangle area per face = AREA_FACTOR * h^2; min angle MIN_ANGLE."""
+    import triangle
     from pathlib import Path
+    from hydrolib.core.dflowfm.net.models import Network
+    t = time.time()
+    verts, seg, regions, holes = pslg(f)
+    log(f"PSLG: {len(verts)} vertices, {len(seg)} segments, {len(regions)} regions, {len(holes)} holes")
+    tri = triangle.triangulate({"vertices": verts, "segments": seg, "regions": regions, "holes": holes},
+                               f"pq{MIN_ANGLE}aAQ")
+    T, V = tri["triangles"], tri["vertices"]
+    keep = tri["triangle_attributes"].ravel() > 0        # drop pockets not seeded by any road/block face
+    T = T[keep]
+    used = np.unique(T)
+    remap = -np.ones(len(V), dtype=np.int64); remap[used] = np.arange(used.size)
+    T, V = remap[T], V[used]
+    log(f"triangle: {len(V)} nodes, {len(T)} triangles ({(~keep).sum()} unseeded dropped), {time.time() - t:.0f}s")
+    ang, area = mesh_quality(V[:, 0], V[:, 1], T)
+    e = np.unique(np.sort(np.r_[T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]], axis=1), axis=0)
+    el = np.hypot(*(V[e[:, 0]] - V[e[:, 1]]).T)
+    land = f[f.cls != "channel"]
+    log(f"quality: min angle {ang.min():.1f} deg (p1 {np.percentile(ang.min(1), 1):.1f}), "
+        f"coverage {area.sum() / 1e6:.4f} km2 vs faces {land.area.sum() / 1e6:.4f} km2, "
+        f"edge length p5/p50/p95 = {np.percentile(el, 5):.1f}/{np.percentile(el, 50):.1f}/{np.percentile(el, 95):.1f} m")
+    net = Network()
+    net._mesh2d._set_mesh2d(V[:, 0].copy(), V[:, 1].copy(), e.astype(np.int32).ravel())
+    m = net._mesh2d.meshkernel.mesh2d_get()
+    chk = check_mesh(m)
+    log(f"meshkernel: {m.node_x.size} nodes, {m.edge_x.size} edges, {m.face_x.size} faces "
+        f"(triangle gave {len(T)}); checks {chk}")
+    # pinch nodes (two holes touching at a vertex) and the odd small polygon meshkernel finds
+    # around a dropped unseeded pocket are harmless; the other defects are not
+    if chk["non_manifold_edges"] or chk["edges_without_face"] or chk["inverted_cells"]:
+        log("WARNING: mesh failed the checks above")
     net.to_file(Path(out_nc))
     log("saved", out_nc)
-    return xy, tri
+    return V, T
 
 
 # ----------------------------------------------------------------------------- main
@@ -553,11 +467,17 @@ def main():
     ap.add_argument("--stage", choices=["roads", "channels", "partition", "mesh"], default="mesh",
                     help="run up to this stage; earlier stages are re-read from the gpkg if present")
     ap.add_argument("--reuse", action="store_true", help="reuse roads/channels layers from a previous run")
+    ap.add_argument("--from-faces", action="store_true",
+                    help="skip roads/channels/partition: mesh the faces layer of a previous run")
     ap.add_argument("--out", default=None, help="output prefix (default <data>/mesh)")
     a = ap.parse_args()
     D = a.data.rstrip("/\\") + "/"
     pre = a.out or D + ("mesh_test" if a.bbox else "mesh")
     gp = pre + "_boundaries.gpkg"
+    out_nc = pre + "2d_net.nc" if not a.bbox else pre + "_net.nc"
+    if a.from_faces:
+        build_mesh(gpd.read_file(gp, layer="faces"), out_nc)
+        return
     reg = gpd.read_file(D + "region.shp").to_crs(CRS).union_all()
     if a.bbox:
         reg = reg.intersection(box(*a.bbox))
@@ -583,7 +503,7 @@ def main():
     f.to_file(gp, layer="faces", driver="GPKG")
     if a.stage == "partition":
         return
-    build_mesh(f, pre + "2d_net.nc" if not a.bbox else pre + "_net.nc")
+    build_mesh(f, out_nc)
 
 
 if __name__ == "__main__":
