@@ -125,9 +125,12 @@ python houston/remove_by_mask.py houston/houston_white_oak_bayou_cleaned open_dr
 python houston/connect_outfalls_to_channels.py houston/houston_white_oak_bayou_cleaned --max-dist 100 --network-outlet --overwrite
 python houston/fix_t_junctions.py houston/houston_white_oak_bayou_cleaned --action both --snap-dist 0.5 --overwrite
 python houston/check_connectivity.py houston/houston_white_oak_bayou_cleaned --ref-layer open_drains --ref-objectid 197064
+python houston/fill_null_attributes.py houston/houston_white_oak_bayou_v4_cleaned --overwrite 
 
-python houston/remove_stormdrain_features.py houston/houston_white_oak_bayou_v3
-python houston/outfalls_to_inlets.py houston/houston_white_oak_bayou_v3_cleaned --overwrite
+python houston/remove_stormdrain_features.py houston/houston_white_oak_bayou_v4_cleaned --overwrite
+python houston/remove_standalone_nodes.py houston/houston_white_oak_bayou_v4_cleaned --overwrite
+python houston/outfalls_to_inlets.py houston/houston_white_oak_bayou_v4_cleaned --overwrite
+python houston/create_boundary_conditions.py houston/houston_white_oak_bayou_v4_cleaned/output/template.gpkg --side both --prefix R
 
 create a script to connect outfall to offroad channels.
 
