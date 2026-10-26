@@ -7,6 +7,7 @@ import argparse, os
 import numpy as np, xarray as xr, geopandas as gpd, matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Patch
 
@@ -15,7 +16,8 @@ ZOOMS = {  # name: (cx, cy, half-width, title)
     "aoi_boundary": (946500, 4224800, 600, "AOI boundary transition (8 m -> 16 m)"),
     "channel_wob": (948080, 4220700, 300, "White Oak Bayou: no mesh inside top of bank"),
     "outside_freeway": (950393, 4224856, 400, "Outside AOI: freeway + frontage roads"),
-    "far_outside": (930000, 4234000, 800, "Far from AOI (road 12 m, block 24 m)"),
+    "outer_bands": (938500, 4226600, 2000, "Outer bands 3-5-8 km (block 24/32/48 m, no roads beyond 5 km)"),
+    "far_outside": (930000, 4234000, 1500, "Far from AOI, > 12 km (block 96 m)"),
 }
 COL = {"road": "#f4c27a", "block": "#e3eedb", "channel": "#9fc5e8"}
 
@@ -58,15 +60,18 @@ def main():
     h = np.sqrt(face_area(x, y, fn) / 0.433)
     fig, ax = plt.subplots(figsize=(16, 11))
     hb = ax.hexbin(fx, fy, C=h, gridsize=320, reduce_C_function=np.median, cmap="viridis",
-                   vmin=4, vmax=26, mincnt=1)
+                   norm=LogNorm(vmin=4, vmax=100), mincnt=1)
     chan.plot(ax=ax, color="#1f5fa8", lw=0)
+    faces[faces.zone != "aoi"].dissolve("zone").boundary.plot(ax=ax, color="w", lw=0.6, alpha=0.7)
     reg.boundary.plot(ax=ax, color="k", lw=1)
     aoi.boundary.plot(ax=ax, color="r", lw=1.5)
-    fig.colorbar(hb, ax=ax, shrink=0.7, label="cell size (equiv. triangle edge) [m]")
+    cb = fig.colorbar(hb, ax=ax, shrink=0.7, label="cell size (equiv. triangle edge) [m]")
+    cb.set_ticks([4, 8, 16, 32, 64, 100]); cb.set_ticklabels(["4", "8", "16", "32", "64", "100"])
     for name, (cx, cy, r, _) in ZOOMS.items():
         ax.add_patch(plt.Rectangle((cx - r, cy - r), 2 * r, 2 * r, fill=False, ec="w", lw=1.2))
         ax.annotate(name, (cx + r, cy + r), color="w", fontsize=9, weight="bold")
-    ax.set_title(f"2D mesh: {len(fx):,} cells, {len(x):,} nodes  (red = AOI, blue = channels, no mesh)")
+    ax.set_title(f"2D mesh: {len(fx):,} cells, {len(x):,} nodes  (red = AOI, white = distance bands, "
+                 f"blue = channels, no mesh)")
     ax.set_aspect("equal"); ax.ticklabel_format(style="plain"); ax.tick_params(labelsize=8)
     fig.savefig(out + "mesh_overview.png", dpi=150, bbox_inches="tight"); plt.close(fig)
     print("saved", out + "mesh_overview.png")

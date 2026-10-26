@@ -371,7 +371,9 @@ def main():
             rows = gdf.drop(columns="geometry").loc[np.repeat(np.arange(len(gdf)), reps)]
             flat = [g for item in out_geoms for g in (item if isinstance(item, list) else [item])]
             if multi:
-                flat = [MultiLineString([g]) if g.geom_type == "LineString" else g for g in flat]
+                # rows without geometry pass through unchanged (None)
+                flat = [MultiLineString([g]) if g is not None and g.geom_type == "LineString" else g
+                        for g in flat]
             out = gpd.GeoDataFrame(rows.reset_index(drop=True), geometry=flat, crs=gdf.crs)
             out.to_file(dest_gpkg, layer=layer, driver="GPKG", engine="pyogrio")
             print(f"Wrote {dest_gpkg}:{layer} ({len(gdf)} -> {len(out)} rows)")
