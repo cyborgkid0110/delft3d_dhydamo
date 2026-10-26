@@ -130,7 +130,103 @@ python houston/fill_null_attributes.py houston/houston_white_oak_bayou_v4_cleane
 python houston/remove_stormdrain_features.py houston/houston_white_oak_bayou_v4_cleaned --overwrite
 python houston/remove_standalone_nodes.py houston/houston_white_oak_bayou_v4_cleaned --overwrite
 python houston/outfalls_to_inlets.py houston/houston_white_oak_bayou_v4_cleaned --overwrite
+
+After convert to DAMO:
 python houston/create_boundary_conditions.py houston/houston_white_oak_bayou_v4_cleaned/output/template.gpkg --side both --prefix R
+
+Fix invalid manhole / inlet levels BEFORE the DAMO conversion (they become storage-node streetlevel / bedlevel)
+   (found in WOB v4_cleaned: ~1460 nodes with INVERTELEV <= 0 / DEPTH up to 31805 ft, 60 nodes with RIMELEV 10-18 ft off the DEM;
+    the pipes there have the same bad UPELEV / DOWNELEV. Rule: rim bad (NaN/<=0 or |rim-DEM|>15 ft) -> DEM; invert bad
+    (NaN/<=0, >= rim, rim-invert > 40 ft) -> lowest valid pipe-end elevation at the node, else rim - 3 m; pipe ends at
+    the nodes that are <= 0 / > 40 ft deep -> node invert; other bad pipe ends -> other end of the pipe, else invert
+    of a node within --snap-node 0.5 m, else DEM - 3 m (e.g. gravity_main 119401, both ends -11.5 ft).
+    QA layer fixed_node_levels)
+   (default: copies the dataset to <dataset>_cleaned and writes the copy -- it must not exist yet; --dry-run reports
+    only, --overwrite writes in place, --dest another copy folder)
+   conda run -n hydrolib_env python houston/fix_invalid_node_levels.py houston/houston_white_oak_bayou_v5 --dry-run
+   conda run -n hydrolib_env python houston/fix_invalid_node_levels.py houston/houston_white_oak_bayou_v5
+     -> houston/houston_white_oak_bayou_v5_cleaned
+
+Convert to DAMO with HyDAMOAdapter (all rules except the 1 m DEM merge, which is slow: keep output/rasters)
+   mv output output_prev ; (run from G:\workspace\github\HyDAMOAdapter)
+   conda run -n hydrolib_env python -m src run ../delft3d_dhydamo/houston/houston_white_oak_bayou_v4_cleaned/rules.yaml --only <all rule ids except dem>
+   cp output_prev/build.json output_prev/source.yaml output/ ; mv output_prev/rasters output/rasters
+   then (repo root, D=houston/houston_white_oak_bayou_v4_cleaned/output):
+   python tool/scripts/fill_storage_levels.py houston/houston_white_oak_bayou_v5_cleaned/output --overwrite
+   python tool/scripts/resample_crosssections.py houston/houston_white_oak_bayou_v5_cleaned/output --overwrite
+   python tool/scripts/set_pipe_inverts.py houston/houston_white_oak_bayou_v5_cleaned/output --overwrite
+   python houston/create_boundary_conditions.py houston/houston_white_oak_bayou_v5_cleaned/output/template.gpkg --side both --prefix R
+   collapse branches < 2 m into one node (D-Flow FM: "Two grid points on branch .. are too close", grid points
+   < 1 m apart; 538 slivers, 481 C_ + 57 R_). Removes the branch, its DU_ culvert and crosssection rows; moves branch /
+   culvert ends, storage nodes, BC points onto the kept node; stubs with a BC on the open end are kept (a BC needs an
+   end node); QA layer collapsed_branches; backup in
+   $D/_backup_short_branches. Then set_pipe_inverts again:
+   python tool/scripts/collapse_short_branches.py houston/houston_white_oak_bayou_v5_cleaned/output --overwrite
+   python tool/scripts/set_pipe_inverts.py houston/houston_white_oak_bayou_v5_cleaned/output --overwrite
+   only for a dataset converted before the pipe-end rule of fix_invalid_node_levels.py existed (v5_cleaned: 9 DU_
+   culverts at -1.4..-3.5 m, 16-28 m below the ground; the model build then stops on the manhole floor): placeholder
+   culvert inverts (<= 0 and > 12.2 m below the DEM, or NaN) -> storage node within 0.5 m, else a valid culvert end at
+   the same point, else the other end, else DEM - 3 m. QA layer fixed_culvert_inverts; backup _backup_culvert_inverts;
+   works on output/ or a submodel folder (applied to v5_cleaned output/, sub2, sub4):
+   python tool/scripts/fix_culvert_inverts.py houston/houston_white_oak_bayou_v5_cleaned/output --dem houston/houston_white_oak_bayou_v5_cleaned/output/rasters/dem_32140.tif --overwrite
+
+Working with submodels (White Oak Bayou, run from repo root, after the DAMO conversion in output/):
+D = houston/houston_white_oak_bayou_v5_cleaned ; ROIs = D/wob_regions.gpkg (layers white_oak_sub1..4)
+
+1. Divide output/ into submodels + remove redundant (standalone) nodes -> D/submodels/sub1..sub4/
+   (each feature goes to exactly ONE ROI -- first match; lines by midpoint, whole, not clipped; features outside every
+    ROI are dropped and counted in submodels/manifest.json. Per sub: template.gpkg, crosssection/, storageareas/,
+    region.shp, 2D_extent.shp, build.json, source.yaml. landuse / afvoergebied are clipped to the ROI.
+    dem.tif is NOT copied (path in manifest.json). Standalone = storage node (tol 0.05 m) / gemaal (pump_snap_maxdist) /
+    boundary condition (boundary_snap_maxdist) not touching any hydroobject / duikersifonhevel; dependent pomp/sturing
+    rows go too; removed ones -> QA layer standalone_nodes in the sub's template.gpkg. Isolated branches are only
+    reported. Re-running keeps mesh files already in sub*/)
+   conda run -n hydrolib_env python tool/scripts/split_wob_submodels.py --data houston/houston_white_oak_bayou_v5_cleaned
+
+2. Build the 2D mesh of each submodel (ROI only, nothing outside it) -> sub*/mesh2d_net.nc + sub*/mesh_boundaries.gpkg
+   (mesh rule: inside the ROI block cells h=16 m, road cells h=4 m, channel banks <= 32 m; outside-ROI sizes
+    (H_OUT) only matter for the full-region mode. Needs the `triangle` package; sub2 takes the longest.
+    The mesh is written FINAL for D-Flow FM (the model build neither orthogonalizes nor sets cosphiutrsh):
+    boundary corners < --min-seg 2 m apart are dropped and PSLG vertices / gaps < --pslg-snap 2 m merged
+    (road edges running along the ROI boundary gave thousands of < 1 m2 slivers); then meshkernel
+    orthogonalization (--ortho 3 25 25 0.975, --no-ortho to skip) and cell merging (2 cells -> 1 polygon,
+    <= 6 nodes) or diagonal flips for cells < --min-cell-area 2 m2, flow links < --small-link 0.1 * cell size
+    and links with D-Flow FM |cos| > --max-cos 0.4 (D-Flow FM stops at 0.5). Prints a "final:" quality line;
+    log per sub -> sub*/mesh_build.log. Previous meshes: sub*/mesh2d_net_prev.nc, mesh_boundaries_prev.gpkg)
+   conda run -n hydrolib_env python houston/build_triangular_mesh.py --data houston/houston_white_oak_bayou_v4_cleaned --all-wob
+   one ROI only: ... --roi wob_regions.gpkg:white_oak_sub2 --out-dir houston/houston_white_oak_bayou_v4_cleaned/submodels/sub2
+
+3. QGIS project per submodel -> sub*/sub*.qgz (region, template.gpkg layers, storage, 2D_extent, mesh layers;
+   mesh_boundaries + mesh2d_net hidden by default; relative paths; needs the QGIS python)
+   "G:\QGIS\QGIS 3.44.8\bin\python-qgis-ltr.bat" tool/scripts/build_wob_qgis_projects.py
+
+4. Delft3D model per submodel -> sub*/delft3d_model (script version of notebook/houston_wob_build.ipynb; uses
+   sub*/mesh2d_net.nc and output/rasters DEM; initial water depth 0 everywhere; run settings override build.json.
+   The mesh is used as written (orthogonal from step 2; --orthogonalize re-runs meshkernel orthogonalization here),
+   no cosphiutrsh. netFile = DFM_net.nc; [geometry] slotw1D = 0.01 (--slotw1d; the 1 mm default makes pressurized
+   pipes non-converge); qhRelax / wrishp_enc are not written.
+   Pipe bed = culvert invert: each C_ pipe gets crosssections at the culvert link's own 1D grid points
+   (leftLevel before, rightLevel after, min of both on a grid point at the culvert), so D-Flow FM does not lower the
+   bed ("bedlevel of the channel ... is changed"); manhole/inlet bedLevel is lowered to the lowest pipe end at its node
+   ("bedlevel is below the bedlevel of the assigned storage area"). Pond nodes are written without the -999 fields;
+   the build stops on placeholder storage levels (bed/street < -50 m, depth > 12.2 m, pond level <= 0):
+   fix_invalid_node_levels.py / fill_storage_levels.py were not run)
+   conda run -n hydrolib_env python tool/scripts/build_wob_submodel_model.py <D>/submodels/sub1 --rain-mm-h 150 --duration-h 3 --dt-min 5
+   (sub2 is the largest: run it alone, the others can run in parallel; ~1-3 min each)
+
+4b. Partition each Delft3D model for an MPI run (default 16 subdomains; run AFTER every (re)build of step 4)
+   (netFile read from DFM.mdu; a net file not named *_net.nc (network.nc) is renamed to DFM_net.nc first -- the
+    partitioner needs *_net.nc; stale DFM_####.mdu / .cache / *_####_net.nc of an earlier partitioning are removed;
+    runs `dflowfm-cli.exe --partition:ndomains=N:contiguous=1:method=1:icgsolver=6 DFM.mdu` (log dflowfm/partition.log;
+    contiguous falls back to 0 as the 1D2D graph is not contiguous) -> dflowfm/DFM_0000..N-1.mdu (icgSolver 6 = PETSc)
+    + DFM_0000..N-1_net.nc; writes dimr_config_parallel.xml (process 0..N-1, DFM_COMM_DFMWORLD), run_parallel.bat
+    (run_dimr_parallel.bat N) and run_parallel.sh (run_dimr.sh -c N / mpirun -np N; edit D3D_HOME / D3D_BIN for the
+    remote machine). dimr_config.xml + run.bat stay the sequential run. --dry-run, --seed for a reproducible split)
+   conda run -n hydrolib_env python tool/scripts/partition_wob_submodel.py --all --ndomains 16
+   conda run -n hydrolib_env python tool/scripts/partition_wob_submodel.py <D>/submodels/sub1 --ndomains 16
+   then copy sub*/delft3d_model to the compute machine and start run_parallel.bat / ./run_parallel.sh there
+
+5. TODO: couplings between submodels.
 
 create a script to connect outfall to offroad channels.
 
