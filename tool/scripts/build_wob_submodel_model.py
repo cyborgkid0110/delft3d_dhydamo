@@ -8,7 +8,7 @@ the template); the map/plot cells are dropped. Run settings are CLI options and 
   duration (default 3 h), user time step and map/his output step (default 5 min).
 
 Run (conda env hydrolib_env), from the repo root:
-    python tool/scripts/build_wob_submodel_model.py houston/houston_white_oak_bayou_v4_cleaned/submodels/sub1
+    python tool/scripts/build_wob_submodel_model.py houston/houston_white_oak_bayou_v5_cleaned/submodels/sub1
 Output: <sub>/delft3d_model (dimr_config.xml, run.bat, dflowfm/DFM.mdu ...).
 """
 import argparse
@@ -903,6 +903,12 @@ fm.external_forcing.rainfall = True
 fm.output.wrimap_rain = True
 
 t0 = time.time()
+# partition files of an earlier build (partition_wob_submodel.py) do not match the new model
+_stale = [p for p in (output_path / "dflowfm").glob("DFM_[0-9][0-9][0-9][0-9]*") if p.is_file()]
+for p in _stale:
+    p.unlink()
+if _stale:
+    print(f"removed {len(_stale)} partition files of an earlier build (re-run partition_wob_submodel.py)")
 fm.filepath = output_path / "dflowfm" / "DFM.mdu"
 dimr = DIMR()
 dimr.component.append(FMComponent(name="DFM", workingDir=output_path / "dflowfm", model=fm, inputfile=fm.filepath))
@@ -911,8 +917,29 @@ dimr.save(recurse=True)
 # replace run_dimr.bat path with the locally installed Delft3D FM
 dimr = DIMRWriter(output_path=output_path, dimr_path=build["dimr_path"])
 dimr.write_dimrconfig(fm, rr_model=None, rtc_model=None)
-dimr.add_crs(output_path / "dflowfm")
 dimr.write_runbat(debuglevel=6)
+
+
+def add_crs(netfile, epsg):
+    """CRS variable of the net file. DIMRWriter.add_crs always writes EPSG:28992 (Amersfoort /
+    RD New) and opens the first *.nc of the folder (a partition file once those exist)."""
+    import netCDF4
+    from pyproj import CRS
+    crs = CRS.from_epsg(epsg)
+    with netCDF4.Dataset(netfile, "r+") as d:
+        d.Conventions = "CF-1.8 UGRID-1.0 Deltares-0.10"
+        v = d.variables.get("projected_coordinate_system") or d.createVariable("projected_coordinate_system", "i4")
+        v.setncatts({
+            "long_name": crs.name, "epsg": np.int32(epsg), "EPSG_code": f"EPSG:{epsg}",
+            "grid_mapping_name": crs.to_cf().get("grid_mapping_name", crs.name),
+            "longitude_of_prime_meridian": crs.prime_meridian.longitude,
+            "semi_major_axis": crs.ellipsoid.semi_major_metre, "semi_minor_axis": crs.ellipsoid.semi_minor_metre,
+            "inverse_flattening": crs.ellipsoid.inverse_flattening,
+            "proj4_params": crs.to_proj4(), "wkt": crs.to_wkt(), "value": "value is equal to EPSG code",
+        })
+
+
+add_crs(output_path / "dflowfm" / NET_FILE, build["crs_epsg"])
 
 # strip each dataFile in fieldfile.ini down to its own file name
 fieldfile = output_path / "dflowfm" / "fieldfile.ini"

@@ -171,9 +171,11 @@ Convert to DAMO with HyDAMOAdapter (all rules except the 1 m DEM merge, which is
    python tool/scripts/fix_culvert_inverts.py houston/houston_white_oak_bayou_v5_cleaned/output --dem houston/houston_white_oak_bayou_v5_cleaned/output/rasters/dem_32140.tif --overwrite
 
 Working with submodels (White Oak Bayou, run from repo root, after the DAMO conversion in output/):
-D = houston/houston_white_oak_bayou_v5_cleaned ; ROIs = D/wob_regions.gpkg (layers white_oak_sub1..4)
+D = houston/houston_white_oak_bayou_v5_cleaned ; ROIs = D/wob_regions.gpkg (layers white_oak_sub1..N; every
+    white_oak_sub<k> layer is used by the split / mesh steps). Current: 5 ROIs from D/submodel_boundary_v2/*.shp
+    (190.69 km2; the 4-ROI version is kept as wob_regions_v1.gpkg + submodels_v1/)
 
-1. Divide output/ into submodels + remove redundant (standalone) nodes -> D/submodels/sub1..sub4/
+1. Divide output/ into submodels + remove redundant (standalone) nodes -> D/submodels/sub1..subN/
    (each feature goes to exactly ONE ROI -- first match; lines by midpoint, whole, not clipped; features outside every
     ROI are dropped and counted in submodels/manifest.json. Per sub: template.gpkg, crosssection/, storageareas/,
     region.shp, 2D_extent.shp, build.json, source.yaml. landuse / afvoergebied are clipped to the ROI.
@@ -182,6 +184,51 @@ D = houston/houston_white_oak_bayou_v5_cleaned ; ROIs = D/wob_regions.gpkg (laye
     rows go too; removed ones -> QA layer standalone_nodes in the sub's template.gpkg. Isolated branches are only
     reported. Re-running keeps mesh files already in sub*/)
    conda run -n hydrolib_env python tool/scripts/split_wob_submodels.py --data houston/houston_white_oak_bayou_v5_cleaned
+
+1a. Hand edits of the submodel edges (2026-10-27, after the split; run in this order). Backups sub*/_backup_branch_edits,
+   _backup_t_junctions, _backup_short_branches (each kept from its first run).
+   - Keep / remove branches: --keep copies a master branch into the submodel (the other submodel keeps it too: overlap),
+     --remove deletes it; its DU_ culvert, crosssection rows + definitions, storage nodes on it (removed only when on no
+     remaining branch), boundaries on its ends go with it. QA layer edited_branches.
+     A kept branch comes with the reach linking it to the submodel (the river pieces of the same channel, e.g. R_201026
+     -> R_230713 -> R_230714 -> C_483411 of sub2; for R_29256 the culvert C_484832 to C_484831); the script warns when a
+     kept branch touches no branch of the submodel.
+     conda run -n hydrolib_env python tool/scripts/edit_submodel_branches.py <D>/submodels/sub2 --keep R_26967 R_230887 R_230888 R_230889 R_230890 R_230891 R_230892 R_230893 R_230894 R_201026 R_230713 R_230714 R_201153 R_29256 C_484832 --overwrite
+     conda run -n hydrolib_env python tool/scripts/edit_submodel_branches.py <D>/submodels/sub3 --keep R_58749 R_230772 R_230773 R_230774 R_230775 C_484831 C_484830 C_484829 C_483428 R_81742 --overwrite
+     conda run -n hydrolib_env python tool/scripts/edit_submodel_branches.py <D>/submodels/sub4 --remove R_197334 --keep C_3585 C_3589 C_3590 C_3592 C_3602 C_3605 R_29265 C_484609 C_303571 C_303572 C_303573 R_58819 --overwrite
+     conda run -n hydrolib_env python tool/scripts/edit_submodel_branches.py <D>/submodels/sub5 --keep R_58765 R_231201 --remove C_303571 C_303572 C_303573 C_484609 --overwrite
+   - T-junctions: v5_cleaned still had 102 in the source (e.g. R_58790 end on C_483415). Fixed in the source with step 8
+     (fix_t_junctions.py <D> --action both --snap-dist 0.5 --overwrite; backup <D>/_backup_t_junctions/Stormdrain.gpkg) +
+     ONLY the OBJECTID part of step 10 (unique_ids of fill_null_attributes.py: 67 pieces renumbered, R_231403.., C_484839..;
+     a full step 10 would also fill 2118 empty pipe WIDTHs). output/ was converted before: it still has the 101 T's.
+     Same split directly in the submodels (95 T's; pieces named after the source OBJECTIDs, culvert inverts interpolated,
+     boundaries on joined ends removed: BC_47 of sub4); QA layer split_t_junctions:
+     for s in 1 2 3 4 5; do conda run -n hydrolib_env python tool/scripts/split_damo_t_junctions.py <D>/submodels/sub$s --source <D>/Stormdrain.gpkg --overwrite; done
+   - Boundary nodes (replaces the split's master boundaries, same rule as for output/: every open R_ end, water level 0.1;
+     codes renumbered BC_1.. per submodel; cut ends included -> step 1c is not used): sub1 11, sub2 13, sub3 19, sub4 14, sub5 6
+     (sub2 hand edit: C_156956 removed by the user -> R_230729 start open, BC_2; drop its crosssection row)
+     for s in 1 2 3 4 5; do conda run -n hydrolib_env python houston/create_boundary_conditions.py <D>/submodels/sub$s/template.gpkg --side both --prefix R; done
+   - Pieces < 2 m left by the T split (sub3 1, sub4 1, sub5 2):
+     for s in 3 4 5; do conda run -n hydrolib_env python tool/scripts/collapse_short_branches.py <D>/submodels/sub$s --overwrite; done
+
+1b. Lengthen short boundary stubs in every submodel (a boundary on a branch < 20 m sets the time step: sub1 BC_28 on the
+   1.18 m R_27757 -> 2.9 m3 node, 37.6 m3/s out, dt 0.055 s vs ~0.4 s of the 2D cells). The open end + boundary point
+   move outward along the last segment until the branch is 20 m (junctions unchanged; merging into the upstream river
+   is not possible where an outfall pipe joins). Done per submodel (after the split: the added reach lies outside the
+   ROI, a master-level extension would move the line midpoint out of its ROI). QA layer extended_bc_stubs; backup
+   sub*/_backup_bc_stubs. v5_cleaned: BC_28, BC_29 (sub1), BC_42 (sub3), BC_44, BC_47 (sub4), BC_52 (sub5)
+   for s in 1 2 3 4 5; do conda run -n hydrolib_env python tool/scripts/extend_bc_stubs.py <D>/submodels/sub$s --overwrite; done
+
+1c. Boundaries where the split cut a river (the split only hands out the master boundaries; a river end left open by
+   the cut is closed in D-Flow FM: outflow backs up, upstream inflow is missing). Only R_ branches (--prefixes R_,
+   default; pipe ends stay closed). Direction from the bed beyond the cut (master river trapezium bottomlevel, own pipe
+   slope for C_): outflow -> "waterstand vaste waarde" 0.1 m (free outfall, as the master boundaries); inflow ->
+   "debiet vaste waarde" 0 m3/s, placeholder for the discharge of the upstream submodel (one-way coupling, run
+   upstream first). Codes BC_cut<k>_<n>; QA layer cut_boundaries + sub*/cut_boundaries.csv (coupling table with the
+   neighbour submodel); backup sub*/_backup_cut_boundaries. v5_cleaned: 16 river cuts (sub1 3, sub2 5, sub3 6, sub4 2).
+   Then step 1b again for the new short stubs (BC_cut4_001 on R_230989, 4.6 m):
+   conda run -n hydrolib_env python tool/scripts/add_cut_boundaries.py <D> --overwrite
+   for s in 1 2 3 4 5; do conda run -n hydrolib_env python tool/scripts/extend_bc_stubs.py <D>/submodels/sub$s --overwrite; done
 
 2. Build the 2D mesh of each submodel (ROI only, nothing outside it) -> sub*/mesh2d_net.nc + sub*/mesh_boundaries.gpkg
    (mesh rule: inside the ROI block cells h=16 m, road cells h=4 m, channel banks <= 32 m; outside-ROI sizes
@@ -203,7 +250,8 @@ D = houston/houston_white_oak_bayou_v5_cleaned ; ROIs = D/wob_regions.gpkg (laye
 4. Delft3D model per submodel -> sub*/delft3d_model (script version of notebook/houston_wob_build.ipynb; uses
    sub*/mesh2d_net.nc and output/rasters DEM; initial water depth 0 everywhere; run settings override build.json.
    The mesh is used as written (orthogonal from step 2; --orthogonalize re-runs meshkernel orthogonalization here),
-   no cosphiutrsh. netFile = DFM_net.nc; [geometry] slotw1D = 0.01 (--slotw1d; the 1 mm default makes pressurized
+   no cosphiutrsh. netFile = DFM_net.nc (CRS variable written as EPSG:32140 -- DIMRWriter.add_crs wrote EPSG:28992;
+   partition files of an earlier build are removed); [geometry] slotw1D = 0.01 (--slotw1d; the 1 mm default makes pressurized
    pipes non-converge); qhRelax / wrishp_enc are not written.
    Pipe bed = culvert invert: each C_ pipe gets crosssections at the culvert link's own 1D grid points
    (leftLevel before, rightLevel after, min of both on a grid point at the culvert), so D-Flow FM does not lower the
@@ -222,7 +270,7 @@ D = houston/houston_white_oak_bayou_v5_cleaned ; ROIs = D/wob_regions.gpkg (laye
     + DFM_0000..N-1_net.nc; writes dimr_config_parallel.xml (process 0..N-1, DFM_COMM_DFMWORLD), run_parallel.bat
     (run_dimr_parallel.bat N) and run_parallel.sh (run_dimr.sh -c N / mpirun -np N; edit D3D_HOME / D3D_BIN for the
     remote machine). dimr_config.xml + run.bat stay the sequential run. --dry-run, --seed for a reproducible split)
-   conda run -n hydrolib_env python tool/scripts/partition_wob_submodel.py --all --ndomains 16
+   conda run -n hydrolib_env python tool/scripts/partition_wob_submodel.py --all --ndomains 16   (v5_cleaned 2026-10-27: 16)
    conda run -n hydrolib_env python tool/scripts/partition_wob_submodel.py <D>/submodels/sub1 --ndomains 16
    then copy sub*/delft3d_model to the compute machine and start run_parallel.bat / ./run_parallel.sh there
 

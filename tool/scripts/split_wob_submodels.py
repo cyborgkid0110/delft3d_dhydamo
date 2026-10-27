@@ -1,12 +1,12 @@
 """
 Split the White Oak Bayou HyDAMO dataset (<data>/output) into submodels, one per ROI
-polygon of <data>/wob_regions.gpkg (layers white_oak_sub1..4), and remove standalone
+polygon of <data>/wob_regions.gpkg (layers white_oak_sub1..N), and remove standalone
 nodes from every submodel.
 
 Division
 --------
 * Every feature goes to exactly ONE ROI (the ROIs overlap by a few hundred m2): the first
-  ROI (sub1..sub4) that contains its representative location. Lines (hydroobject,
+  ROI (sub1..subN) that contains its representative location. Lines (hydroobject,
   duikersifonhevel) are kept whole and located by their midpoint; no clipping.
   Features in no ROI are "unassigned" and reported (not written).
 * Aspatial tables follow their parent through globalid foreign keys (pomp <- gemaal,
@@ -43,7 +43,7 @@ import shapely
 warnings.filterwarnings("ignore")
 
 _REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-DEFAULT_DATA = os.path.join(_REPO, "houston", "houston_white_oak_bayou_v4_cleaned")
+DEFAULT_DATA = os.path.join(_REPO, "houston", "houston_white_oak_bayou_v5_cleaned")
 CRS = "EPSG:32140"
 GPKG = "template.gpkg"
 LINE_LAYERS = ["hydroobject", "duikersifonhevel", "profiellijn"]
@@ -101,10 +101,14 @@ def main(data, tol):
     build = json.load(open(os.path.join(src, "build.json")))
     pump_tol, bc_tol = build.get("pump_snap_maxdist", 15.0), build.get("boundary_snap_maxdist", 10.0)
 
-    names = [f"white_oak_sub{i}" for i in range(1, 5)]
-    rois_gdf = [gpd.read_file(os.path.join(data, "wob_regions.gpkg"), layer=n).to_crs(CRS) for n in names]
+    # every white_oak_sub<k> layer of wob_regions.gpkg, in order of k
+    rgp = os.path.join(data, "wob_regions.gpkg")
+    nums = sorted(int(n[len("white_oak_sub"):]) for n, _ in pyogrio.list_layers(rgp)
+                  if n.startswith("white_oak_sub") and n[len("white_oak_sub"):].isdigit())
+    names = [f"white_oak_sub{i}" for i in nums]
+    rois_gdf = [gpd.read_file(rgp, layer=n).to_crs(CRS) for n in names]
     rois = [g.union_all() for g in rois_gdf]
-    snames = [f"sub{i}" for i in range(1, 5)]
+    snames = [f"sub{i}" for i in nums]
 
     gtypes = {l: pyogrio.read_info(gp, layer=l)["geometry_type"] for l, _ in pyogrio.list_layers(gp)}
     geo = {}

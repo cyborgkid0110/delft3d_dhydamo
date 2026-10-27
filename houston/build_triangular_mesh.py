@@ -824,7 +824,7 @@ def main():
                          "nothing outside the ROI is meshed, no distance bands")
     ap.add_argument("--out-dir", default=None, help="ROI mode: output dir (mesh_boundaries.gpkg, mesh2d_net.nc)")
     ap.add_argument("--all-wob", action="store_true",
-                    help="mesh white_oak_sub1..4 of <data>/wob_regions.gpkg into <data>/submodels/sub{1..4}/")
+                    help="mesh every white_oak_sub<k> layer of <data>/wob_regions.gpkg into <data>/submodels/sub<k>/")
     ap.add_argument("--out", default=None, help="output prefix (default <data>/mesh)")
     g = ap.add_argument_group("small cells / orthogonality (the written mesh is final: no further orthogonalization)")
     g.add_argument("--pslg-snap", type=float, default=PSLG_SNAP,
@@ -848,7 +848,10 @@ def main():
     if a.all_wob:
         import subprocess, sys, os
         rest = [s for s in sys.argv[1:] if s != "--all-wob"]
-        for i in range(1, 5):
+        import pyogrio
+        nums = sorted(int(n[13:]) for n, _ in pyogrio.list_layers(D + "wob_regions.gpkg")
+                      if n.startswith("white_oak_sub") and n[13:].isdigit())
+        for i in nums:
             od = f"{D}submodels/sub{i}"; os.makedirs(od, exist_ok=True)
             # echo the run and log it to <sub>/mesh_build.log
             with open(f"{od}/mesh_build.log", "w") as lf:

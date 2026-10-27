@@ -27,10 +27,10 @@ from osgeo import ogr  # noqa: E402
 
 EPSG = 32140
 POINT, LINE, POLYGON = 0, 1, 2  # >=3 == no geometry
-REGION_RGB = [(120, 190, 240), (240, 170, 100), (140, 210, 140), (220, 150, 210)]
+REGION_RGB = [(120, 190, 240), (240, 170, 100), (140, 210, 140), (220, 150, 210), (230, 210, 110)]
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SUB = os.path.abspath(os.path.join(
-    HERE, "..", "..", "houston", "houston_white_oak_bayou_v4_cleaned", "submodels"))
+    HERE, "..", "..", "houston", "houston_white_oak_bayou_v5_cleaned", "submodels"))
 
 
 def geom_rank(layer):

@@ -30,7 +30,7 @@ Per model (<sub>/delft3d_model):
   net file, only for viewing the partitions) is deleted unless --keep-idomain.
 
 Run (conda env hydrolib_env), from the repo root:
-    python tool/scripts/partition_wob_submodel.py houston/houston_white_oak_bayou_v4_cleaned/submodels/sub1
+    python tool/scripts/partition_wob_submodel.py houston/houston_white_oak_bayou_v5_cleaned/submodels/sub1
     python tool/scripts/partition_wob_submodel.py --all --ndomains 16 [--dry-run]
 Then on the compute machine, in <sub>/delft3d_model: run_parallel.bat or ./run_parallel.sh
 """
@@ -48,7 +48,7 @@ from hydrolib.core.dflowfm.ini.parser import Parser, ParserConfig
 from hydrolib.core.dflowfm.ini.serializer import INISerializerConfig, write_ini
 
 _REPO = Path(__file__).resolve().parents[2]
-DEFAULT_SUBMODELS = _REPO / "houston" / "houston_white_oak_bayou_v4_cleaned" / "submodels"
+DEFAULT_SUBMODELS = _REPO / "houston" / "houston_white_oak_bayou_v5_cleaned" / "submodels"
 DEFAULT_ENGINE_BIN = Path(r"G:\Deltares\D-HYDRO Suite 2026.02 1D2D\plugins\DeltaShell.Dimr\kernels\x64\bin")
 PARALLEL_DIMR = "dimr_config_parallel.xml"
 MPI_COMMUNICATOR = "DFM_COMM_DFMWORLD"
