@@ -41,7 +41,7 @@ from hydrolib.core.dflowfm.ext.models import ExtModel, Meteo, MeteoForcingFileTy
 from hydrolib.core.dflowfm.friction.models import FrictionModel
 from hydrolib.core.dflowfm.inifield.models import DiskOnlyFileModel, IniFieldModel, InitialField, ParameterField
 from hydrolib.core.dflowfm.mdu.models import FMModel, Numerics, Output
-from hydrolib.core.dflowfm.net.models import Link1d2d
+from hydrolib.core.dflowfm.net.models import Branch, Link1d2d
 from hydrolib.core.dflowfm.obs.models import ObservationPointModel
 from hydrolib.core.dflowfm.onedfield.models import OneDFieldBranch, OneDFieldModel
 from hydrolib.core.dflowfm.polyfile.models import Metadata, Point, PolyFile, PolyObject
@@ -390,17 +390,28 @@ if sources["observation_points"] is not None:
 else:
     print("Skipping observation points: no 'observation_points' source for this dataset")
 
+# Same as mesh.mesh1d_add_branches_from_gdf, but pipes are added with force_midpoint=False.
+# A branch whose two end nodes are already in the network has no grid point of its own when it
+# is shorter than ~1.5 node_distance; hydrolib then forces one at mid-length, i.e. exactly on
+# the pipe's culvert. That node only stores the water of the short pipe (0.5 m3 in a 2.35 m
+# pipe) while the whole culvert discharge passes through it: dt = CFLMax * volume / outflow
+# fell to 0.05-0.1 s and one such node limited 68% of sub2's time steps. Without the midpoint a
+# short pipe is one link between its two manholes, and the culvert sits on that link.
 t0 = time.time()
 network = fm.geometry.netfile.network
-mesh.mesh1d_add_branches_from_gdf(
-    network,
-    branches=hydamo.branches,
-    branch_name_col="code",
-    node_distance=build["node_distance"],
-    max_dist_to_struc=None,
-    structures=structures,
-)
-print(f"1D mesh: {len(network._mesh1d.mesh1d_node_x)} nodes ({time.time() - t0:.0f} s)")
+_struc_chainage = {b: np.unique(g.to_numpy(float))
+                   for b, g in structures.dropna(subset=["branchid"]).groupby("branchid")["chainage"]}
+_n_single = 0
+for _name, _geom in zip(hydamo.branches["code"], hydamo.branches.geometry):
+    _branch = Branch(geometry=np.array(_geom.coords[:]))
+    _branch.generate_nodes(mesh1d_edge_length=build["node_distance"],
+                           structure_chainage=_struc_chainage.get(_name), max_dist_to_struc=None)
+    _pipe = _name.startswith(build["conduit_prefix"])
+    _n_before = len(network._mesh1d.mesh1d_node_x)
+    network.mesh1d_add_branch(_branch, name=_name, force_midpoint=not _pipe)
+    _n_single += _pipe and len(network._mesh1d.mesh1d_node_x) == _n_before
+print(f"1D mesh: {len(network._mesh1d.mesh1d_node_x)} nodes, {_n_single} pipes as a single link "
+      f"between existing nodes ({time.time() - t0:.0f} s)")
 
 missing = hydamo.crosssections.get_branches_without_crosssection()
 print(f"{len(missing)} branches are missing a cross section", missing[:10])
@@ -942,7 +953,7 @@ def add_crs(netfile, epsg):
 add_crs(output_path / "dflowfm" / NET_FILE, build["crs_epsg"])
 
 # strip each dataFile in fieldfile.ini down to its own file name
-fieldfile = output_path / "dflowfm" / "fieldfile.ini"
+fieldfile = output_path / "dflowfm" / "fieldFile.ini"   # exact case: Linux paths are case-sensitive
 lines = fieldfile.read_text().splitlines(keepends=True)
 newlines = []
 for l in lines:

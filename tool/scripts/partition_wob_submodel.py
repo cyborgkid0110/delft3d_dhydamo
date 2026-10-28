@@ -204,6 +204,13 @@ def write_run_scripts(model_dir, ndomains, engine_bin):
     return bat, sh
 
 
+def net_has_1d(net_file):
+    """True when the net file holds a 1D mesh with at least one node."""
+    import netCDF4
+    with netCDF4.Dataset(net_file) as ds:
+        return "mesh1d_nNodes" in ds.dimensions and len(ds.dimensions["mesh1d_nNodes"]) > 0
+
+
 def domain_summary(net_file, idmn):
     """(owned 2D cells, owned 1D nodes, ghost-inclusive 2D cells) of one partitioned net file."""
     try:
@@ -256,30 +263,43 @@ def partition_model(model_dir, args):
             for p in stale:
                 p.unlink()
 
-    # 3. partition
-    opts = f"ndomains={args.ndomains}:contiguous={int(args.contiguous)}:method={args.method}:icgsolver={args.icgsolver}"
-    if args.seed:
-        opts += f":seed={args.seed}"
+    # 3. partition. A subdomain without any 1D network (METIS can cut a pure 2D piece at a high
+    # domain count) makes that rank fail on every 1D structure and the run die at initialization
+    # (sub4, 48 domains); such a partitioning is redone with another METIS seed.
     exe, env = engine_command(args.engine_bin)
-    cmd = [str(exe), f"--partition:{opts}", mdu.name]
-    print(f"  (cd {fm_dir}) {' '.join(cmd)}")
-    if args.dry_run:
-        print(f"  dry run: would write {mdu.stem}_0000..{args.ndomains - 1:04d}.mdu, "
-              f"{net_base}_0000..{args.ndomains - 1:04d}_net.nc, {PARALLEL_DIMR}, run_parallel.bat/.sh")
-        return
-    if not exe.is_file():
+    if not args.dry_run and not exe.is_file():
         raise FileNotFoundError(f"D-Flow FM executable not found: {exe} (use --engine-bin)")
-    log = fm_dir / "partition.log"
-    with open(log, "w") as f:
-        rc = subprocess.run(cmd, cwd=fm_dir, env=env, stdout=f, stderr=subprocess.STDOUT).returncode
-    text = log.read_text(errors="replace")
-    if rc != 0:
-        raise RuntimeError(f"partitioner exit code {rc}, see {log}")
-    if "Retrying partitioning now with" in text:
-        print("  METIS: 1D2D graph not contiguous -> kernel fell back to contiguous=0")
-    for l in text.splitlines():
-        if l.startswith("** ERROR"):
-            print("  " + l)
+    has_1d = net_has_1d(fm_dir / netfile)
+    for attempt in range(args.retries + 1):
+        seed = args.seed + attempt if (args.seed or attempt) else 0
+        opts = f"ndomains={args.ndomains}:contiguous={int(args.contiguous)}:method={args.method}:icgsolver={args.icgsolver}"
+        if seed:
+            opts += f":seed={seed}"
+        cmd = [str(exe), f"--partition:{opts}", mdu.name]
+        print(f"  (cd {fm_dir}) {' '.join(cmd)}")
+        if args.dry_run:
+            print(f"  dry run: would write {mdu.stem}_0000..{args.ndomains - 1:04d}.mdu, "
+                  f"{net_base}_0000..{args.ndomains - 1:04d}_net.nc, {PARALLEL_DIMR}, run_parallel.bat/.sh")
+            return
+        log = fm_dir / "partition.log"
+        with open(log, "w") as f:
+            rc = subprocess.run(cmd, cwd=fm_dir, env=env, stdout=f, stderr=subprocess.STDOUT).returncode
+        text = log.read_text(errors="replace")
+        if rc != 0:
+            raise RuntimeError(f"partitioner exit code {rc}, see {log}")
+        if "Retrying partitioning now with" in text:
+            print("  METIS: 1D2D graph not contiguous -> kernel fell back to contiguous=0")
+        for l in text.splitlines():
+            if l.startswith("** ERROR"):
+                print("  " + l)
+        no_1d = [i for i in range(args.ndomains) if has_1d and
+                 (fm_dir / f"{net_base}_{i:04d}_net.nc").is_file() and not net_has_1d(fm_dir / f"{net_base}_{i:04d}_net.nc")]
+        if not no_1d:
+            break
+        print(f"  subdomains without 1D network: {no_1d} -> partitioning again with METIS seed {args.seed + attempt + 1}")
+    else:
+        raise RuntimeError(f"every partitioning left subdomains without 1D network ({args.retries} retries); "
+                           f"use fewer domains")
 
     # 4. check the subdomain files, set icgsolver in the partitioned MDUs
     missing, wrong_net = [], []
@@ -330,6 +350,8 @@ def main():
     ap.add_argument("--icgsolver", type=int, choices=[6, 7], default=6,
                     help="solver of the partitioned MDUs: 6 PETSc (default, recommended), 7 parallel GS+CG")
     ap.add_argument("--seed", type=int, default=0, help="METIS seed for a reproducible partitioning (0: random)")
+    ap.add_argument("--retries", type=int, default=10,
+                    help="re-partition with the next METIS seed while a subdomain has no 1D network (default 10)")
     ap.add_argument("--engine-bin", type=Path, default=DEFAULT_ENGINE_BIN,
                     help="Delft3D FM x64/bin folder with dflowfm-cli.exe and run_dimr_parallel.bat")
     ap.add_argument("--keep-idomain", action="store_true", help="keep DFM_interpreted_idomain_*.nc (partition view)")
